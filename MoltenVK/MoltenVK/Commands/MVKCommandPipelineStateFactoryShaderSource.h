@@ -295,6 +295,20 @@ kernel void cmdDrawIndirectConvertBuffers(const device char* srcBuff [[buffer(0)
 	destBuff[idx].instanceCount *= viewCount;
 }
 
+kernel void cmdDrawIndirectCountConvertBuffers(const device char* srcBuff [[buffer(0)]],
+                                               device MTLDrawPrimitivesIndirectArguments* destBuff [[buffer(1)]],
+                                               constant uint32_t& srcStride [[buffer(2)]],
+                                               constant uint32_t& drawCount [[buffer(3)]],
+                                               const device uint32_t* countBuff [[buffer(4)]],
+                                               uint idx [[thread_position_in_grid]]) {
+	if (idx >= drawCount) { return; }
+	const device auto& src = *reinterpret_cast<const device MTLDrawPrimitivesIndirectArguments*>(srcBuff + idx * srcStride);
+	destBuff[idx] = src;
+	if (idx >= countBuff[0]) {
+		destBuff[idx].instanceCount = 0;
+	}
+}
+
 kernel void cmdDrawIndexedIndirectConvertBuffers(const device char* srcBuff [[buffer(0)]],
                                                  device MTLDrawIndexedPrimitivesIndirectArguments* destBuff [[buffer(1)]],
                                                  constant uint32_t& srcStride [[buffer(2)]],
@@ -328,6 +342,20 @@ kernel void cmdDrawIndexedIndirectConvertBuffers(const device char* srcBuff [[bu
 				                           vtxAdj);
 				break;
 		}
+	}
+}
+
+kernel void cmdDrawIndexedIndirectCountConvertBuffers(const device char* srcBuff [[buffer(0)]],
+                                                      device MTLDrawIndexedPrimitivesIndirectArguments* destBuff [[buffer(1)]],
+                                                      constant uint32_t& srcStride [[buffer(2)]],
+                                                      constant uint32_t& drawCount [[buffer(3)]],
+                                                      const device uint32_t* countBuff [[buffer(4)]],
+                                                      uint idx [[thread_position_in_grid]]) {
+	if (idx >= drawCount) { return; }
+	const device auto& src = *reinterpret_cast<const device MTLDrawIndexedPrimitivesIndirectArguments*>(srcBuff + idx * srcStride);
+	destBuff[idx] = src;
+	if (idx >= countBuff[0]) {
+		destBuff[idx].instanceCount = 0;
 	}
 }
 
