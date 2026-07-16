@@ -35,8 +35,14 @@ class MVKOcclusionQueryPool;
 struct MVKShaderImplicitRezBinding;
 
 enum class MVKMetalGraphicsStage {
+	#if MVK_XCODE_14
+	Object,
+	#endif
 	Vertex,
 	Fragment,
+	#if MVK_XCODE_14
+	Mesh,
+	#endif
 	Count
 };
 
@@ -70,15 +76,27 @@ struct MVKResourceBinder {
 		reinterpret_cast<void(*)(id, SEL, id<MTLSamplerState>, NSUInteger)>(objc_msgSend)(encoder, _setSampler, sampler, index);
 	}
 	enum class Stage {
+	#if MVK_XCODE_14
+		Object   = static_cast<uint32_t>(MVKMetalGraphicsStage::Object),
+	#endif
 		Vertex   = static_cast<uint32_t>(MVKMetalGraphicsStage::Vertex),
 		Fragment = static_cast<uint32_t>(MVKMetalGraphicsStage::Fragment),
+	#if MVK_XCODE_14
+		Mesh     = static_cast<uint32_t>(MVKMetalGraphicsStage::Mesh),
+	#endif
 		Compute  = static_cast<uint32_t>(MVKMetalGraphicsStage::Count),
 		Count
 	};
 	static const MVKResourceBinder& Get(Stage stage) GCC_CONST;
 	static const MVKResourceBinder& Get(MVKMetalGraphicsStage stage) { return Get(static_cast<Stage>(stage)); }
+	#if MVK_XCODE_14
+	static const MVKResourceBinder& Object()   { return Get(Stage::Object); }
+	#endif
 	static const MVKResourceBinder& Vertex()   { return Get(Stage::Vertex); }
 	static const MVKResourceBinder& Fragment() { return Get(Stage::Fragment); }
+	#if MVK_XCODE_14
+	static const MVKResourceBinder& Mesh()     { return Get(Stage::Mesh); }
+	#endif
 	static const MVKResourceBinder& Compute()  { return Get(Stage::Compute); }
 };
 
@@ -104,11 +122,17 @@ struct MVKVertexBufferBinder {
 		reinterpret_cast<void(*)(id, SEL, NSUInteger, NSUInteger, NSUInteger)>(objc_msgSend)(encoder, _setOffsetDynamic, offset, stride, index);
 	}
 	enum class Stage {
+	#if MVK_XCODE_14
+		Object,
+	#endif
 		Vertex,
 		Compute,
 		Count
 	};
 	static const MVKVertexBufferBinder& Get(Stage stage) GCC_CONST;
+	#if MVK_XCODE_14
+	static const MVKVertexBufferBinder& Object()  { return Get(Stage::Object); }
+	#endif
 	static const MVKVertexBufferBinder& Vertex()  { return Get(Stage::Vertex); }
 	static const MVKVertexBufferBinder& Compute() { return Get(Stage::Compute); }
 };
@@ -128,8 +152,14 @@ struct MVKImplicitBufferData {
 };
 
 enum class MVKResourceUsageStages : uint8_t {
+	#if MVK_XCODE_14
+	Object   = static_cast<uint32_t>(MVKMetalGraphicsStage::Object),
+	#endif
 	Vertex   = static_cast<uint32_t>(MVKMetalGraphicsStage::Vertex),
 	Fragment = static_cast<uint32_t>(MVKMetalGraphicsStage::Fragment),
+	#if MVK_XCODE_14
+	Mesh     = static_cast<uint32_t>(MVKMetalGraphicsStage::Mesh),
+	#endif
 	All      = static_cast<uint32_t>(MVKMetalGraphicsStage::Count),
 	Count,
 	Compute  = 0, // Aliases with Render stages
@@ -268,10 +298,18 @@ struct MVKStageResourceBindings {
 
 template <typename T>
 struct MVKOnePerGraphicsStage: public MVKOnePerEnumEntry<T, MVKMetalGraphicsStage> {
+	#if MVK_XCODE_14
+	      T& object()         { return (*this)[MVKMetalGraphicsStage::Object]; }
+	const T& object()   const { return (*this)[MVKMetalGraphicsStage::Object]; }
+	#endif
 	      T& vertex()         { return (*this)[MVKMetalGraphicsStage::Vertex]; }
 	const T& vertex()   const { return (*this)[MVKMetalGraphicsStage::Vertex]; }
 	      T& fragment()       { return (*this)[MVKMetalGraphicsStage::Fragment]; }
 	const T& fragment() const { return (*this)[MVKMetalGraphicsStage::Fragment]; }
+	#if MVK_XCODE_14
+	      T& mesh()           { return (*this)[MVKMetalGraphicsStage::Mesh]; }
+	const T& mesh()     const { return (*this)[MVKMetalGraphicsStage::Mesh]; }
+	#endif
 };
 
 enum class MVKMetalRenderEncoderStateFlag {
@@ -572,5 +610,4 @@ private:
 	/// If true, accumulation will be run at the end of the next render pass.
 	bool _shouldAccumulate = false;
 };
-
 

@@ -106,6 +106,13 @@ void MVKCmdBindIndexBuffer::encode(MVKCommandEncoder* cmdEncoder) {
     cmdEncoder->getState().bindIndexBuffer(_binding);
 }
 
+/* Describes the draw parameters for mesh pipelines. */
+struct DrawInfo {
+	int32_t indexed;
+	int32_t indexSize;
+	uint64_t indexBuffer;
+};
+
 
 #pragma mark -
 #pragma mark MVKCmdDraw
@@ -318,7 +325,33 @@ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
                                         patchIndexBufferOffset: 0
                                                  instanceCount: 1
                                                   baseInstance: 0];
-                } else {
+#if MVK_XCODE_14
+                }
+                else if (pipeline->isGeometryPipeline()) {
+					DrawInfo drawInfo = {};
+					drawInfo.indexed = false;
+
+					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo
+															length: sizeof(drawInfo)
+														   atIndex: pipeline->getDrawInfoBufferIndex()];
+
+					int threadCount = 0;
+					if (pipeline->getMTLPrimitiveType() == MTLPrimitiveTypeTriangle)
+						threadCount = _vertexCount / 3;
+					else if (pipeline->getMTLPrimitiveType() == MTLPrimitiveTypeTriangleStrip)
+						threadCount = _vertexCount - 2;
+					else
+						reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported primitive type: %lu", pipeline->getMTLPrimitiveType());
+
+					if (_firstVertex) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "First vertex not supported yet.");
+					if (_firstInstance) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "First instance not supported yet.");
+
+					[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake(threadCount, _instanceCount, 1)
+										threadsPerObjectThreadgroup: MTLSizeMake(1, 1, 1)
+										  threadsPerMeshThreadgroup: MTLSizeMake(1, 1, 1)];
+                }
+#endif
+                else {
                     MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
                     uint32_t viewCount = subpass->isMultiview() ? subpass->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex()) : 1;
                     uint32_t instanceCount = _instanceCount * viewCount;
@@ -607,7 +640,38 @@ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
                                         patchIndexBufferOffset: 0
                                                  instanceCount: 1
                                                   baseInstance: 0];
-                } else {
+#if MVK_XCODE_14
+                }
+                else if (pipeline->isGeometryPipeline()) {
+					DrawInfo drawInfo = {};
+					drawInfo.indexed = true;
+					drawInfo.indexSize = (int)idxSize;
+					drawInfo.indexBuffer = ibb.mtlBuffer.gpuAddress + idxBuffOffset;
+
+					[cmdEncoder->_mtlRenderEncoder useResource: ibb.mtlBuffer
+															 usage: MTLResourceUsageRead
+															stages: MTLRenderStageObject];
+					[cmdEncoder->_mtlRenderEncoder setObjectBytes: &drawInfo
+															length: sizeof(drawInfo)
+														   atIndex: pipeline->getDrawInfoBufferIndex()];
+
+					int threadCount = 0;
+					if (pipeline->getMTLPrimitiveType() == MTLPrimitiveTypeTriangle)
+						threadCount = _indexCount / 3;
+					else if (pipeline->getMTLPrimitiveType() == MTLPrimitiveTypeTriangleStrip)
+						threadCount = _indexCount - 2;
+					else
+						reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported primitive type %lu.", pipeline->getMTLPrimitiveType());
+
+					if (_vertexOffset) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Vertex offset not supported yet.");
+					if (_firstInstance) reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "First instance not supported yet.");
+
+					[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake(threadCount, _instanceCount, 1)
+										threadsPerObjectThreadgroup: MTLSizeMake(1, 1, 1)
+										  threadsPerMeshThreadgroup: MTLSizeMake(1, 1, 1)];
+                }
+#endif
+                else {
                     MVKRenderSubpass* subpass = cmdEncoder->getSubpass();
                     uint32_t viewCount = subpass->isMultiview() ? subpass->getViewCountInMetalPass(cmdEncoder->getMultiviewPassIndex()) : 1;
                     uint32_t instanceCount = _instanceCount * viewCount;
@@ -888,6 +952,13 @@ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
 	auto* pipeline = cmdEncoder->getGraphicsPipeline();
 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
 	auto& dvcLimits = cmdEncoder->getDeviceProperties().limits;
+#if MVK_XCODE_14
+	if (pipeline->isGeometryPipeline()) {
+		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "CmdDrawIndirect with geometry shader is not yet supported.");
+		return;
+	}
+#endif
+
 	// Metal doesn't support triangle fans, so encode it as indexed indirect triangles instead.
 	if (pipeline->getVkPrimitiveTopology() == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
 		encodeIndexedIndirect(cmdEncoder, indirectBuffer, indirectBufferOffset, indirectBufferStride);
@@ -1255,6 +1326,13 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
 			indirectBufferStride,
 			_drawCount,
 			true);
+
+#if MVK_XCODE_14
+	if (pipeline->isGeometryPipeline()) {
+		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "CmdDrawIndexedIndirect with geometry shader is not yet supported.");
+		return;
+	}
+#endif
 
 	MVKVertexAdjustments vtxAdjmts{};
 	vtxAdjmts.mtlIndexType = ibb.mtlIndexType;

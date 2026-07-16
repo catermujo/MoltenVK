@@ -1258,6 +1258,9 @@ MVKImage::MVKImage(MVKDevice* device, const VkImageCreateInfo* pCreateInfo) : MV
 
 	_isLinearForAtomics = _shouldSupportAtomics && !getMetalFeatures().nativeTextureAtomics && _arrayLayers == 1 && getImageType() == VK_IMAGE_TYPE_2D;
 
+    if (mvkIsAnyFlagEnabled(getCombinedUsage(), VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !getDevice()->getPhysicalDevice()->getMetalFeatures()->renderLinearTextures)
+        _isLinearForAtomics = false;
+
 	_isDepthStencilAttachment = (mvkAreAllFlagsEnabled(pCreateInfo->usage, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
 								 mvkAreAllFlagsEnabled(pixFmts->getVkFormatProperties3(pCreateInfo->format).optimalTilingFeatures, VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT));
 	_rowByteAlignment = _isLinear || _isLinearForAtomics ? _device->getVkFormatTexelBufferAlignment(pCreateInfo->format, this) : mvkEnsurePowerOfTwo(pixFmts->getBytesPerBlock(pCreateInfo->format));
