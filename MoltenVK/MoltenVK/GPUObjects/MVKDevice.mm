@@ -2811,6 +2811,7 @@ void MVKPhysicalDevice::initFeatures() {
     _features.shaderInt16 = true;
     _features.multiDrawIndirect = true;
     _features.inheritedQueries = true;
+    _features.geometryShader = true;
 	_features.vertexPipelineStoresAndAtomics = true;
 	_features.fragmentStoresAndAtomics = true;
 
