@@ -580,10 +580,17 @@ id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdResolveColorImageMT
 }
 
 id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectConvertBuffersMTLComputePipelineState(bool indexed,
-																																	   MVKVulkanAPIDeviceObject* owner) {
+																																				   MVKVulkanAPIDeviceObject* owner) {
 	return newMTLComputePipelineState(indexed
-																	  ? "cmdDrawIndexedIndirectConvertBuffers"
-																	  : "cmdDrawIndirectConvertBuffers", owner);
+																																				  ? "cmdDrawIndexedIndirectConvertBuffers"
+																																				  : "cmdDrawIndirectConvertBuffers", owner);
+}
+
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawMeshIndirectConvertBuffersMTLComputePipelineState(bool indexed,
+																																					 MVKVulkanAPIDeviceObject* owner) {
+	return newMTLComputePipelineState(indexed
+																																					 ? "cmdDrawIndexedMeshIndirectConvertBuffers"
+																																					 : "cmdDrawMeshIndirectConvertBuffers", owner);
 }
 
 id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdDrawIndirectCountConvertBuffersMTLComputePipelineState(bool indexed,

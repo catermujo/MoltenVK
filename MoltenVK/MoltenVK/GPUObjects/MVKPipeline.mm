@@ -784,13 +784,18 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 				break;
 			case VK_SHADER_STAGE_GEOMETRY_BIT:
 #if MVK_XCODE_14
-				if (getMetalFeatures().mslVersion >= 030000) {
-					pGeometrySS = pSS;
-					_isGeometryPipeline = true;
-					if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
-						pGeometryFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
-					}
+				if (getMetalFeatures().mslVersion < 030000) {
+					setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Geometry shaders require MSL 3.0 or newer."));
+					return;
 				}
+				pGeometrySS = pSS;
+				_isGeometryPipeline = true;
+				if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
+					pGeometryFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
+				}
+#else
+				setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Geometry shaders require Xcode 14 or newer."));
+				return;
 #endif
 				break;
 			case VK_SHADER_STAGE_FRAGMENT_BIT:
@@ -802,6 +807,14 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 			default:
 				break;
 		}
+	}
+	if (pGeometrySS && (pTessCtlSS || pTessEvalSS)) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Metal mesh pipelines do not support tessellation with geometry shaders."));
+		return;
+	}
+	if (pGeometrySS && mvkIsMultiview(getRenderingCreateInfo(pCreateInfo)->viewMask)) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Geometry shaders with multiview are not supported."));
+		return;
 	}
 
 	_vertexModule = getOrCreateShaderModule(device, pVertexSS, _ownsVertexModule);
@@ -839,7 +852,22 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 		_staticStateData.patchControlPoints = pCreateInfo->pTessellationState->patchControlPoints;
 
 	_mtlPrimitiveType = MTLPrimitiveTypePoint;
+	if (_isGeometryPipeline && _dynamicStateFlags.has(MVKRenderStateFlag::PrimitiveTopology)) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Metal mesh pipelines require a static primitive topology."));
+		return;
+	}
 	if (pCreateInfo->pInputAssemblyState && !isRenderingPoints()) {
+		VkPrimitiveTopology topology = pCreateInfo->pInputAssemblyState->topology;
+		bool isStrip = topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
+					   topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
+					   topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+					   topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+		if (_isGeometryPipeline && isStrip &&
+				(pCreateInfo->pInputAssemblyState->primitiveRestartEnable ||
+				 _dynamicStateFlags.has(MVKRenderStateFlag::PrimitiveRestartEnable))) {
+			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Metal mesh pipelines do not support primitive restart for strip topologies."));
+			return;
+		}
 		_mtlPrimitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(pCreateInfo->pInputAssemblyState->topology);
 		if (_isGeometryPipeline && pCreateInfo->pInputAssemblyState->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
 			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Metal mesh pipelines do not support triangle fans."));
@@ -1694,16 +1722,34 @@ bool MVKGraphicsPipeline::addTessEvalShaderToPipeline(MTLRenderPipelineDescripto
 }
 
 #if MVK_XCODE_14
-static bool setMeshPrimitiveType(SPIRVToMSLConversionConfiguration& shaderConfig, MTLPrimitiveType primitiveType) {
-	switch (primitiveType) {
-		case MTLPrimitiveTypeTriangle:
+static bool setMeshPrimitiveType(SPIRVToMSLConversionConfiguration& shaderConfig, VkPrimitiveTopology topology) {
+	switch (topology) {
+		case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Points;
+			return true;
+		case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Lines;
+			return true;
+		case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::LineStrip;
+			return true;
+		case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::LinesAdjacency;
+			return true;
+		case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::LineStripAdjacency;
+			return true;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
 			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Triangles;
 			return true;
-		case MTLPrimitiveTypeTriangleStrip:
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
 			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::TriangleStrip;
 			return true;
-		case MTLPrimitiveTypePoint:
-			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::Points;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::TrianglesAdjacency;
+			return true;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::TriangleStripAdjacency;
 			return true;
 		default:
 			return false;
@@ -1727,8 +1773,9 @@ bool MVKGraphicsPipeline::addVertexShaderToPipeline(MTLMeshRenderPipelineDescrip
 	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
 	shaderConfig.options.mslOptions.for_mesh_pipeline = true;
 	shaderConfig.options.shouldFlipVertexY = false;
-	if (!setMeshPrimitiveType(shaderConfig, _mtlPrimitiveType)) {
-		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported geometry primitive type: %lu", _mtlPrimitiveType);
+	VkPrimitiveTopology topology = pCreateInfo->pInputAssemblyState ? pCreateInfo->pInputAssemblyState->topology : VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+	if (!setMeshPrimitiveType(shaderConfig, topology)) {
+		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported geometry primitive topology: %d", topology);
 		return false;
 	}
 	addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
@@ -1761,8 +1808,9 @@ bool MVKGraphicsPipeline::addGeometryShaderToPipeline(MTLMeshRenderPipelineDescr
 	shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
 	shaderConfig.options.mslOptions.for_mesh_pipeline = true;
 	shaderConfig.options.shouldFlipVertexY = true;
-	if (!setMeshPrimitiveType(shaderConfig, _mtlPrimitiveType)) {
-		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported geometry primitive type: %lu", _mtlPrimitiveType);
+	VkPrimitiveTopology topology = pCreateInfo->pInputAssemblyState ? pCreateInfo->pInputAssemblyState->topology : VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+	if (!setMeshPrimitiveType(shaderConfig, topology)) {
+		reportMessage(MVK_CONFIG_LOG_LEVEL_ERROR, "Unsupported geometry primitive topology: %d", topology);
 		return false;
 	}
 	addPrevStageOutputToShaderConversionConfig(shaderConfig, vertexOutputs);
@@ -2230,7 +2278,7 @@ void MVKGraphicsPipeline::initShaderConversionConfig(SPIRVToMSLConversionConfigu
 		uint32_t extra = getImplicitBufferIndex(stage, 3);
 		switch (stage) {
 			case kMVKShaderStageVertex:
-				// Since we currently can't use multiview with tessellation or geometry shaders,
+				// Since we currently can't use multiview with tessellation,
 				// to conserve the number of buffer bindings, use the same bindings for the
 				// view range buffer as for the tessellation index buffer.
 				_stageResources[stage].implicitBuffers.ids[MVKImplicitBuffer::ViewRange] = extra;
