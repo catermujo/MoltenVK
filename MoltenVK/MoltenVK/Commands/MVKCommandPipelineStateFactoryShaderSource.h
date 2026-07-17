@@ -377,6 +377,78 @@ kernel void cmdDrawIndirectCopyZeroDivisorVertexBuffers(const device char* indir
 	destBuff[idx] = srcBuff[(size_t)baseInstance * vertexStride + byteIdx];
 }
 
+typedef struct {
+	int32_t indexed;
+	int32_t indexSize;
+	uint64_t indexBuffer;
+	int32_t vertexOffset;
+	uint32_t firstVertex;
+	uint32_t firstInstance;
+} MVKMeshDrawInfo;
+
+static inline uint32_t mvkMeshThreadCount(uint32_t topology, uint32_t vertexCount) {
+	switch (topology) {
+		case 0u: return vertexCount;
+		case 1u: return vertexCount / 2u;
+		case 2u: return vertexCount >= 2u ? vertexCount - 1u : 0u;
+		case 3u: return vertexCount / 3u;
+		case 4u: return vertexCount >= 3u ? vertexCount - 2u : 0u;
+		case 6u: return vertexCount / 4u;
+		case 7u: return vertexCount >= 4u ? vertexCount - 3u : 0u;
+		case 8u: return vertexCount / 6u;
+		case 9u: return vertexCount >= 6u ? vertexCount - 5u : 0u;
+		default: return 0u;
+	}
+}
+
+kernel void cmdDrawMeshIndirectConvertBuffers(const device char* srcBuff [[buffer(0)]],
+													 device MTLDispatchThreadgroupsIndirectArguments* dispatchBuff [[buffer(1)]],
+													 device MVKMeshDrawInfo* drawInfoBuff [[buffer(2)]],
+													 constant uint32_t& srcStride [[buffer(3)]],
+													 constant uint32_t& drawCount [[buffer(4)]],
+													 constant uint32_t& topology [[buffer(5)]],
+													 constant uint32_t& viewCount [[buffer(6)]],
+													 uint idx [[thread_position_in_grid]]) {
+	if (idx >= drawCount) { return; }
+	const device auto& src = *reinterpret_cast<const device MTLDrawPrimitivesIndirectArguments*>(srcBuff + idx * srcStride);
+	device auto& dispatch = dispatchBuff[idx];
+	device auto& drawInfo = drawInfoBuff[idx];
+	dispatch.threadgroupsPerGrid[0] = mvkMeshThreadCount(topology, src.vertexCount);
+	dispatch.threadgroupsPerGrid[1] = src.instanceCount * viewCount;
+	dispatch.threadgroupsPerGrid[2] = 1u;
+	drawInfo.indexed = 0;
+	drawInfo.indexSize = 0;
+	drawInfo.indexBuffer = 0;
+	drawInfo.vertexOffset = 0;
+	drawInfo.firstVertex = src.vertexStart;
+	drawInfo.firstInstance = src.baseInstance;
+}
+
+kernel void cmdDrawIndexedMeshIndirectConvertBuffers(const device char* srcBuff [[buffer(0)]],
+													 device MTLDispatchThreadgroupsIndirectArguments* dispatchBuff [[buffer(1)]],
+													 device MVKMeshDrawInfo* drawInfoBuff [[buffer(2)]],
+													 constant uint32_t& srcStride [[buffer(3)]],
+													 constant uint32_t& drawCount [[buffer(4)]],
+													 constant uint32_t& topology [[buffer(5)]],
+													 constant uint32_t& viewCount [[buffer(6)]],
+													 constant uint32_t& indexSize [[buffer(7)]],
+													 constant uint64_t& indexBuffer [[buffer(8)]],
+													 uint idx [[thread_position_in_grid]]) {
+	if (idx >= drawCount) { return; }
+	const device auto& src = *reinterpret_cast<const device MTLDrawIndexedPrimitivesIndirectArguments*>(srcBuff + idx * srcStride);
+	device auto& dispatch = dispatchBuff[idx];
+	device auto& drawInfo = drawInfoBuff[idx];
+	dispatch.threadgroupsPerGrid[0] = mvkMeshThreadCount(topology, src.indexCount);
+	dispatch.threadgroupsPerGrid[1] = src.instanceCount * viewCount;
+	dispatch.threadgroupsPerGrid[2] = 1u;
+	drawInfo.indexed = 1;
+	drawInfo.indexSize = indexSize;
+	drawInfo.indexBuffer = indexBuffer;
+	drawInfo.vertexOffset = src.baseVertex;
+	drawInfo.firstVertex = src.indexStart;
+	drawInfo.firstInstance = src.baseInstance;
+}
+
 kernel void cmdDrawIndirectTessConvertBuffers(const device char* srcBuff [[buffer(0)]],
                                               device char* destBuff [[buffer(1)]],
                                               device char* paramsBuff [[buffer(2)]],

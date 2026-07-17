@@ -359,7 +359,11 @@ public:
 
 	/** Returns a new MTLComputePipelineState for converting the contents of an indirect buffer. */
 	id<MTLComputePipelineState> newCmdDrawIndirectConvertBuffersMTLComputePipelineState(bool indexed,
-																																	   MVKVulkanAPIDeviceObject* owner);
+																																				   MVKVulkanAPIDeviceObject* owner);
+
+	/** Returns a new MTLComputePipelineState for converting an indirect buffer for a mesh draw. */
+	id<MTLComputePipelineState> newCmdDrawMeshIndirectConvertBuffersMTLComputePipelineState(bool indexed,
+																																				MVKVulkanAPIDeviceObject* owner);
 
 	/** Returns a new MTLComputePipelineState for emulating indirect draw count. */
 	id<MTLComputePipelineState> newCmdDrawIndirectCountConvertBuffersMTLComputePipelineState(bool indexed,

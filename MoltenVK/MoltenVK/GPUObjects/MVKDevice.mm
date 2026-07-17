@@ -2811,7 +2811,9 @@ void MVKPhysicalDevice::initFeatures() {
     _features.shaderInt16 = true;
     _features.multiDrawIndirect = true;
     _features.inheritedQueries = true;
-    _features.geometryShader = true;
+#if MVK_XCODE_14
+    _features.geometryShader = _metalFeatures.mslVersion >= 030000;
+#endif
 	_features.vertexPipelineStoresAndAtomics = true;
 	_features.fragmentStoresAndAtomics = true;
 
@@ -3141,11 +3143,19 @@ void MVKPhysicalDevice::initLimits() {
 
     _properties.limits.sparseAddressSpaceSize = 0;
 
-    _properties.limits.maxGeometryShaderInvocations = 0;
-    _properties.limits.maxGeometryInputComponents = 0;
-    _properties.limits.maxGeometryOutputComponents = 0;
-    _properties.limits.maxGeometryOutputVertices = 0;
-    _properties.limits.maxGeometryTotalOutputComponents = 0;
+    if (_features.geometryShader) {
+        _properties.limits.maxGeometryShaderInvocations = 1;
+        _properties.limits.maxGeometryInputComponents = 64;
+        _properties.limits.maxGeometryOutputComponents = 64;
+        _properties.limits.maxGeometryOutputVertices = 256;
+        _properties.limits.maxGeometryTotalOutputComponents = 1024;
+    } else {
+        _properties.limits.maxGeometryShaderInvocations = 0;
+        _properties.limits.maxGeometryInputComponents = 0;
+        _properties.limits.maxGeometryOutputComponents = 0;
+        _properties.limits.maxGeometryOutputVertices = 0;
+        _properties.limits.maxGeometryTotalOutputComponents = 0;
+    }
 }
 
 #if MVK_MACOS
