@@ -143,7 +143,8 @@ if [ "${conformance_version}" != "" ]; then
 fi
 
 # ----- System settings ------
-export DYLD_LIBRARY_PATH="/usr/local/lib"
+# Use MVK_CTS_DYLD_LIBRARY_PATH when testing a local MoltenVK dylib.
+export DYLD_LIBRARY_PATH="${MVK_CTS_DYLD_LIBRARY_PATH:+${MVK_CTS_DYLD_LIBRARY_PATH}:}/usr/local/lib"
 
 # ----- Metal validation settings ------
 export METAL_DEVICE_WRAPPER_TYPE=1
@@ -171,7 +172,7 @@ echo Testing started at `date +%r`
 start_time=${SECONDS}
 
 "${cts_vk_dir}/deqp-vk"                    \
---deqp-archive-dir="${cts_vk_dir}/.."      \
+--deqp-archive-dir="${cts_vk_dir}"         \
 --deqp-log-filename="/dev/null"            \
 --deqp-log-images=disable                  \
 --deqp-log-shader-sources=disable          \
