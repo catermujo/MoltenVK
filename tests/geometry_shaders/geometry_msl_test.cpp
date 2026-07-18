@@ -43,6 +43,7 @@ int main(int argc, char **argv) {
 		CompilerMSL compiler(std::move(spirv));
 		auto options = compiler.get_msl_options();
 		options.msl_version = 30000;
+		options.argument_buffers = true;
 		options.for_mesh_pipeline = true;
 		options.input_primitive_type = parse_topology(argv[3]);
 		compiler.set_msl_options(options);
