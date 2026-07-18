@@ -258,6 +258,9 @@ public:
 	/** Returns the draw-info buffer index used by the mesh object shader. */
 	uint32_t getDrawInfoBufferIndex() { return _meshDrawInfoBufferIndex; }
 
+	/** Returns the number of geometry shader invocations in the mesh pipeline. */
+	uint32_t getGeometryInvocationCount() { return _geometryInvocations; }
+
 	/** Returns the number of output tessellation patch control points. */
 	uint32_t getOutputControlPointCount() { return _outputControlPointCount; }
 
@@ -435,6 +438,7 @@ protected:
 	uint8_t _primitiveTopologyClass;
 	MTLPrimitiveType _mtlPrimitiveType = MTLPrimitiveTypePoint;
 	uint32_t _meshDrawInfoBufferIndex = 20;
+	uint32_t _geometryInvocations = 1;
 	bool _isRasterizing = false;
 	bool _isRasterizingColor = false;
 	bool _isTessellationPipeline = false;

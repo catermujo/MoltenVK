@@ -858,21 +858,7 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 	}
 	if (pCreateInfo->pInputAssemblyState && !isRenderingPoints()) {
 		VkPrimitiveTopology topology = pCreateInfo->pInputAssemblyState->topology;
-		bool isStrip = topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
-					   topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
-					   topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
-					   topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
-		if (_isGeometryPipeline && isStrip &&
-				(pCreateInfo->pInputAssemblyState->primitiveRestartEnable ||
-				 _dynamicStateFlags.has(MVKRenderStateFlag::PrimitiveRestartEnable))) {
-			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Metal mesh pipelines do not support primitive restart for strip topologies."));
-			return;
-		}
 		_mtlPrimitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(pCreateInfo->pInputAssemblyState->topology);
-		if (_isGeometryPipeline && pCreateInfo->pInputAssemblyState->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
-			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Metal mesh pipelines do not support triangle fans."));
-			return;
-		}
 	}
 
 	if (const VkPipelineRasterizationStateCreateInfo* rs = pCreateInfo->pRasterizationState) {
@@ -1296,10 +1282,20 @@ MTLMeshRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLMeshRenderPipelineDe
 	initShaderConversionConfig(shaderConfig, pCreateInfo, reflectData);
 
 	MTLMeshRenderPipelineDescriptor* plDesc = [MTLMeshRenderPipelineDescriptor new]; // retained
+	Compiler geometryCompiler(_geometryModule->getSPIRV());
+	const auto& geometryEntry = geometryCompiler.get_entry_point(pGeometrySS->pName, spv::ExecutionModelGeometry);
+	_geometryInvocations = geometryEntry.invocations;
+	shaderConfig.options.mslOptions.geometry_invocations = _geometryInvocations;
 	if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pVertexSS, pVertexFB)) {
 		[plDesc release];
 		return nil;
 	}
+	MTLStageInputOutputDescriptor* stageInputDesc = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+	if (!addVertexInputToPipeline(stageInputDesc, pCreateInfo->pVertexInputState, shaderConfig)) {
+		[plDesc release];
+		return nil;
+	}
+	stageInputDesc.indexBufferIndex = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids[MVKImplicitBuffer::Index];
 
 	SPIRVShaderOutputs vertexOutputs;
 	std::string errorLog;
@@ -1307,6 +1303,10 @@ MTLMeshRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLMeshRenderPipelineDe
 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get vertex outputs: %s", errorLog.c_str()));
 		[plDesc release];
 		return nil;
+	}
+	if (geometryEntry.flags.get(spv::ExecutionModeOutputPoints)) {
+		shaderConfig.options.mslOptions.enable_point_size_builtin = true;
+		shaderConfig.options.mslOptions.enable_point_size_default = true;
 	}
 
 	if (!addGeometryShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pGeometrySS, pGeometryFB, vertexOutputs)) {
@@ -1733,6 +1733,9 @@ static bool setMeshPrimitiveType(SPIRVToMSLConversionConfiguration& shaderConfig
 		case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
 			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::LineStrip;
 			return true;
+		case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::TriangleFan;
+			return true;
 		case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
 			shaderConfig.options.mslOptions.input_primitive_type = CompilerMSL::Options::PrimitiveTopology::LinesAdjacency;
 			return true;
@@ -1792,7 +1795,7 @@ bool MVKGraphicsPipeline::addVertexShaderToPipeline(MTLMeshRenderPipelineDescrip
 }
 
 bool MVKGraphicsPipeline::addGeometryShaderToPipeline(MTLMeshRenderPipelineDescriptor* plDesc,
-																								 const VkGraphicsPipelineCreateInfo* pCreateInfo,
+																				 const VkGraphicsPipelineCreateInfo* pCreateInfo,
 																								 SPIRVToMSLConversionConfiguration& shaderConfig,
 																								 const VkPipelineShaderStageCreateInfo* pGeometrySS,
 																								 VkPipelineCreationFeedback* pGeometryFB,
@@ -2516,6 +2519,8 @@ void MVKGraphicsPipeline::addVertexInputToShaderConversionConfig(SPIRVToMSLConve
 		}
 		si.shaderVar.offset = pVKVA->offset;
 		si.shaderVar.stride = pVKVB ? pVKVB->stride : 0;
+		if (pVKVB && pVKVB->inputRate == VK_VERTEX_INPUT_RATE_INSTANCE)
+			si.shaderVar.rate = MSL_SHADER_VARIABLE_RATE_PER_PRIMITIVE;
 		if (shaderConfig.options.mslOptions.for_mesh_pipeline) {
 			si.shaderVar.vecsize = getVertexFormatComponents(pVKVA->format);
 			si.shaderVar.normalized = isVertexFormatNormalized(pVKVA->format);
@@ -3199,6 +3204,7 @@ namespace SPIRV_CROSS_NAMESPACE {
 				opt.shader_patch_input_buffer_index,
 				opt.draw_id_buffer_index,
 				opt.reversed_depth_viewport_buffer_index,
+				opt.draw_info_index,
 				opt.shader_input_wg_index,
 				opt.device_index,
 				opt.enable_frag_output_mask,
@@ -3251,7 +3257,10 @@ namespace SPIRV_CROSS_NAMESPACE {
 				opt.force_fragment_with_side_effects_execution,
 				opt.input_attachment_is_ds_attachment,
 				opt.auto_disable_rasterization,
-				opt.use_fast_math_pragmas);
+				opt.use_fast_math_pragmas,
+				opt.for_mesh_pipeline,
+				opt.input_primitive_type,
+				opt.geometry_invocations);
 	}
 
 	template<class Archive>
@@ -3261,7 +3270,12 @@ namespace SPIRV_CROSS_NAMESPACE {
 				si.format,
 				si.builtin,
 				si.vecsize,
-				si.rate);
+				si.rate,
+				si.type,
+				si.offset,
+				si.stride,
+				si.binding,
+				si.normalized);
 	}
 
 	template<class Archive>
@@ -3550,17 +3564,17 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
 
 void mvkValidateCeralArchiveDefinitions() {
 	[[maybe_unused]] size_t missingBytes = 0;
-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(7);
-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>();
+	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
+	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>(3);
 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(29);			// Contains string
-	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(3);
+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
+	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(6);
 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(109);	// Contains collection
+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(40);		// Contains collection
 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
