@@ -1285,6 +1285,12 @@ MTLMeshRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLMeshRenderPipelineDe
 	Compiler geometryCompiler(_geometryModule->getSPIRV());
 	const auto& geometryEntry = geometryCompiler.get_entry_point(pGeometrySS->pName, spv::ExecutionModelGeometry);
 	_geometryInvocations = geometryEntry.invocations;
+	if (_geometryInvocations > getDeviceProperties().limits.maxGeometryShaderInvocations) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Geometry shader invocations (%u) exceed the device limit (%u).", _geometryInvocations, getDeviceProperties().limits.maxGeometryShaderInvocations));
+		[plDesc release];
+		return nil;
+	}
+	plDesc.maxTotalThreadsPerMeshThreadgroup = _geometryInvocations;
 	shaderConfig.options.mslOptions.geometry_invocations = _geometryInvocations;
 	if (!addVertexShaderToPipeline(plDesc, pCreateInfo, shaderConfig, pVertexSS, pVertexFB)) {
 		[plDesc release];
