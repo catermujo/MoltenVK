@@ -2812,7 +2812,7 @@ void MVKPhysicalDevice::initFeatures() {
     _features.multiDrawIndirect = true;
     _features.inheritedQueries = true;
 #if MVK_XCODE_14
-    _features.geometryShader = _metalFeatures.mslVersion >= 030000;
+    _features.geometryShader = _metalFeatures.mslVersion >= 030000 && _gpuCapabilities.supportsMetal3;
 #endif
 	_features.vertexPipelineStoresAndAtomics = true;
 	_features.fragmentStoresAndAtomics = true;
@@ -3144,7 +3144,7 @@ void MVKPhysicalDevice::initLimits() {
     _properties.limits.sparseAddressSpaceSize = 0;
 
     if (_features.geometryShader) {
-        _properties.limits.maxGeometryShaderInvocations = 1;
+        _properties.limits.maxGeometryShaderInvocations = (uint32_t)_mtlDevice.maxThreadsPerThreadgroup.width;
         _properties.limits.maxGeometryInputComponents = 64;
         _properties.limits.maxGeometryOutputComponents = 64;
         _properties.limits.maxGeometryOutputVertices = 256;
