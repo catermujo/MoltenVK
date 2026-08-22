@@ -1,0 +1,1888 @@
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 5f68dd06f2..e05a152960 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -36,6 +36,21 @@
+ static const uint32_t k_unknown_component = ~0u;
+ static const char *force_inline = "static inline __attribute__((always_inline))";
+ 
++
++static bool builtin_is_per_primitive_mesh_output(BuiltIn builtin) {
++	switch (builtin)
++	{
++	case BuiltInLayer:
++	case BuiltInViewportIndex:
++	case BuiltInPrimitiveId:
++	case BuiltInCullPrimitiveEXT:
++		return true;
++	default: break;
++	}
++
++	return false;
++}
++
+ CompilerMSL::CompilerMSL(std::vector<uint32_t> spirv_)
+     : CompilerGLSL(std::move(spirv_))
+ {
+@@ -262,11 +277,13 @@
+ 	                                                       active_input_builtins.get(BuiltInSubgroupGtMask));
+ 	bool need_multiview = get_execution_model() == ExecutionModelVertex && !msl_options.view_index_from_device_index &&
+ 	                      msl_options.multiview_layered_rendering &&
+-	                      (msl_options.multiview || active_input_builtins.get(BuiltInViewIndex));
++	                      (msl_options.multiview || active_input_builtins.get(BuiltInViewIndex)) &&
++	                      !msl_options.for_mesh_pipeline;
+ 	bool need_dispatch_base =
+ 	    msl_options.dispatch_base && get_execution_model() == ExecutionModelGLCompute &&
+ 	    (active_input_builtins.get(BuiltInWorkgroupId) || active_input_builtins.get(BuiltInGlobalInvocationId));
+-	bool need_grid_params = get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation;
++	bool need_grid_params = get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation &&
++	                        !msl_options.for_mesh_pipeline;
+ 	bool need_vertex_base_params =
+ 	    need_grid_params &&
+ 	    (active_input_builtins.get(BuiltInVertexId) || active_input_builtins.get(BuiltInVertexIndex) ||
+@@ -281,7 +298,7 @@
+ 	    msl_options.enable_frag_depth_builtin && msl_options.input_attachment_is_ds_attachment;
+ 	needs_point_size_output =
+ 	    msl_options.enable_point_size_builtin && msl_options.enable_point_size_default &&
+-	    entry_point_is_vertex();
++	    entry_point_is_vertex() && get_execution_model() != ExecutionModelGeometry;
+ 
+ 	if (need_subpass_input || need_sample_pos || need_subgroup_mask || need_vertex_params || need_tesc_params ||
+ 	    need_tese_params || need_multiview || need_dispatch_base || need_vertex_base_params || need_grid_params ||
+@@ -1100,10 +1117,11 @@
+ 	}
+ 
+ 	// If we're returning a struct from a vertex-like entry point, we must return a position attribute.
+-	bool need_position = (get_execution_model() == ExecutionModelVertex || is_tese_shader()) &&
++	bool need_position = (get_execution_model() == ExecutionModelVertex || is_tese_shader() || get_execution_model() == ExecutionModelGeometry) &&
+ 	                     !capture_output_to_buffer && !get_is_rasterization_disabled() &&
+ 	                     !msl_options.auto_disable_rasterization &&
+-	                     !active_output_builtins.get(BuiltInPosition);
++	                     !active_output_builtins.get(BuiltInPosition) &&
++	                     !msl_options.for_mesh_pipeline;
+ 
+ 	if (need_position)
+ 	{
+@@ -1671,9 +1689,642 @@
+ 		statement("threadgroup uint2 spvMeshSizes;");
+ }
+ 
++static int vertex_count_in_primitive(CompilerMSL::Options::PrimitiveTopology top) {
++	switch (top) {
++		case CompilerMSL::Options::PrimitiveTopology::Points:
++			return 1;
++		case CompilerMSL::Options::PrimitiveTopology::Lines:
++		case CompilerMSL::Options::PrimitiveTopology::LineStrip:
++			return 2;
++		case CompilerMSL::Options::PrimitiveTopology::TriangleFan:
++			return 3;
++		case CompilerMSL::Options::PrimitiveTopology::LinesAdjacency:
++		case CompilerMSL::Options::PrimitiveTopology::LineStripAdjacency:
++			return 4;
++		case CompilerMSL::Options::PrimitiveTopology::Triangles:
++		case CompilerMSL::Options::PrimitiveTopology::TriangleStrip:
++			return 3;
++		case CompilerMSL::Options::PrimitiveTopology::TrianglesAdjacency:
++		case CompilerMSL::Options::PrimitiveTopology::TriangleStripAdjacency:
++			return 6;
++	}
++	return 1;
++}
++
++static int primitive_topology_stride(CompilerMSL::Options::PrimitiveTopology top) {
++	switch (top) {
++	case CompilerMSL::Options::PrimitiveTopology::LineStripAdjacency:
++			return 1;
++		case CompilerMSL::Options::PrimitiveTopology::TriangleStripAdjacency:
++			return 2;
++		default:
++			return 1;
++	}
++}
++
++static bool primitive_topology_is_list(CompilerMSL::Options::PrimitiveTopology top) {
++	switch (top) {
++		case CompilerMSL::Options::PrimitiveTopology::Lines:
++		case CompilerMSL::Options::PrimitiveTopology::LinesAdjacency:
++		case CompilerMSL::Options::PrimitiveTopology::Triangles:
++		case CompilerMSL::Options::PrimitiveTopology::TrianglesAdjacency:
++			return true;
++		default:
++			return false;
++	}
++}
++
++static const char* geometry_output_topology(const SPIREntryPoint& execution) {
++	if (execution.flags.get(ExecutionModeOutputPoints)) {
++		return "point";
++	}
++	if (execution.flags.get(ExecutionModeOutputLineStrip) || execution.flags.get(ExecutionModeOutputLinesEXT)) {
++		return "line";
++	}
++	if (execution.flags.get(ExecutionModeOutputTriangleStrip) || execution.flags.get(ExecutionModeOutputTrianglesEXT)) {
++		return "triangle";
++	}
++	SPIRV_CROSS_THROW("Geometry shader output primitive type not supported");
++}
++
++static bool geometry_output_is_strip(const SPIREntryPoint& execution) {
++	return execution.flags.get(ExecutionModeOutputLineStrip) || execution.flags.get(ExecutionModeOutputTriangleStrip);
++}
++
++static uint32_t geometry_output_primitive_count(const SPIREntryPoint& execution) {
++	uint32_t vertices_per_primitive = 3;
++	if (execution.flags.get(ExecutionModeOutputPoints)) {
++		vertices_per_primitive = 1;
++	} else if (execution.flags.get(ExecutionModeOutputLineStrip) || execution.flags.get(ExecutionModeOutputLinesEXT)) {
++		vertices_per_primitive = 2;
++	}
++	if (execution.output_vertices < vertices_per_primitive)
++		return 1;
++	return execution.output_vertices - vertices_per_primitive + 1;
++}
++
++static const char* get_vertex_loader_component_suffix(uint32_t elements) {
++	switch (elements) {
++		case 1: return "";
++		case 2: return "2";
++		case 3: return "3";
++		case 4: return "4";
++		default:
++			SPIRV_CROSS_THROW("Invalid component count: " + std::to_string(elements));
++			return "INVALID_COMPONENT_COUNT";
++	}
++}
++
++static const char* get_normalization_string(MSLShaderVariableFormat type, bool normalized) {
++	if (!normalized)
++		return "";
++	switch (type) {
++		case MSL_SHADER_VARIABLE_FORMAT_UINT16: return " * (1.f/65535.f)";
++		case MSL_SHADER_VARIABLE_FORMAT_UINT8:  return " * (1.f/255.f)";
++		// TODO: Proper positive sint normalization
++		case MSL_SHADER_VARIABLE_FORMAT_INT16: return " * (1.f/32768.f)";
++		case MSL_SHADER_VARIABLE_FORMAT_INT8:  return " * (1.f/128.f)";
++		default: return "";
++	}
++}
++
++static const char *get_variable_format_string(MSLShaderVariableFormat format) {
++	switch (format) {
++		case MSL_SHADER_VARIABLE_FORMAT_INT8: return "byte";
++		case MSL_SHADER_VARIABLE_FORMAT_UINT8: return "ubyte";
++		case MSL_SHADER_VARIABLE_FORMAT_INT16: return "short";
++		case MSL_SHADER_VARIABLE_FORMAT_UINT16: return "ushort";
++		case MSL_SHADER_VARIABLE_FORMAT_INT32: return "int";
++		case MSL_SHADER_VARIABLE_FORMAT_UINT32: return "uint";
++		case MSL_SHADER_VARIABLE_FORMAT_HALF: return "half";
++		case MSL_SHADER_VARIABLE_FORMAT_FLOAT: return "float";
++		default:
++			SPIRV_CROSS_THROW("Format not handled: " + std::to_string(format));
++			return "INVALID_TYPE";
++	}
++}
++
++static const char *get_variable_format_string(SPIRType::BaseType type) {
++	switch (type) {
++		case SPIRType::SByte: return "byte";
++		case SPIRType::UByte: return "ubyte";
++		case SPIRType::Short: return "short";
++		case SPIRType::UShort: return "ushort";
++		case SPIRType::Int: return "int";
++		case SPIRType::UInt: return "uint";
++		case SPIRType::Int64: return "long";
++		case SPIRType::UInt64: return "ulong";
++		case SPIRType::Half: return "half";
++		case SPIRType::Float: return "float";
++		case SPIRType::Double: return "double";
++		default:
++			SPIRV_CROSS_THROW("Type not handled: " + std::to_string(type));
++			return "INVALID_TYPE";
++	}
++}
++
++void CompilerMSL::emit_mesh_wrapper() {
++	auto &execution = get_entry_point();
++
++	if (execution.model == ExecutionModelVertex) {
++		const bool has_stage_output = stage_out_var_id != 0;
++		auto out_var_type = has_stage_output ? get_variable_data_type(get<SPIRVariable>(stage_out_var_id)) : get<SPIRType>(get_uint_type_id());
++
++		// Emit the payload struct
++		statement("struct Payload");
++		begin_scope();
++		statement("uint32_t primitive_id;");
++		if (has_stage_output)
++			statement(join(type_to_glsl(out_var_type), " vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
++		end_scope(";");
++
++		// Emit struct with info about the draw call.
++		statement("struct DrawInfo");
++		begin_scope();
++
++		statement("int32_t indexed;");
++		statement("int32_t indexSize;");
++		statement("int64_t indexBuffer;");
++		statement("int32_t vertexOffset;");
++		statement("uint32_t firstVertex;");
++		statement("uint32_t firstInstance;");
++		statement("uint32_t primitiveRestart;");
++
++		end_scope(";");
++
++		// Object entry point.
++		statement("[[object]]  void ", execution.name, "(object_data Payload &payload [[payload]], mesh_grid_properties meshGridProperties, constant DrawInfo *drawInfo [[buffer(", std::to_string(get_msl_options().draw_info_index),")]],");
++
++		bool vertex_bindings[32] = {false};
++		for (auto si: inputs_by_location) {
++			if (si.second.builtin != BuiltInMax) continue;
++			vertex_bindings[si.second.binding] = true;
++		}
++
++		for (int i = 0; i < 32; ++i) {
++			if (!vertex_bindings[i]) continue;
++			std::string binding = std::to_string(i);
++			statement("device uchar *vb", binding, " [[buffer(", binding, ")]],");
++		}
++
++		// Disable for_mesh_pipeline temporarily so that args get their [[attributes]].
++		msl_options.for_mesh_pipeline = false;
++		string object_arguments;
++		if (msl_options.argument_buffers)
++			object_arguments = entry_point_args_argument_buffer(false, false, false, false);
++		else
++			entry_point_args_discrete_descriptors(object_arguments);
++		msl_options.for_mesh_pipeline = true;
++
++		if (!object_arguments.empty()) object_arguments += ",";
++		statement(object_arguments);
++
++		statement("uint3 positionInGrid [[threadgroup_position_in_grid]]",
++		          msl_options.input_primitive_type == CompilerMSL::Options::PrimitiveTopology::TriangleStripAdjacency ?
++		          ", uint3 threadgroupsPerGrid [[threadgroups_per_grid]]" : "", ")");
++
++		begin_scope();
++
++		statement("int startingIndex = positionInGrid.x * ", primitive_topology_is_list(msl_options.input_primitive_type) ? std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)) : std::to_string(primitive_topology_stride(msl_options.input_primitive_type)), ";");
++		statement("int vertexCount = ", vertex_count_in_primitive(msl_options.input_primitive_type), ";");
++		statement("bool primitiveValid = true;");
++
++		statement("int instanceIndex = positionInGrid.y + drawInfo->firstInstance;");
++
++		statement("for (int i = 0; i < vertexCount; ++i)");
++		begin_scope();
++		statement("uint vertexIndex;");
++		statement("int indexOffset = ", msl_options.input_primitive_type == CompilerMSL::Options::PrimitiveTopology::TriangleFan ? "(i == 0 ? 0 : positionInGrid.x + i)" : "startingIndex + i", ";");
++		if (msl_options.input_primitive_type == CompilerMSL::Options::PrimitiveTopology::TriangleStripAdjacency) {
++			statement("if (threadgroupsPerGrid.x > 1)");
++			begin_scope();
++			statement("if (positionInGrid.x == 0)");
++			begin_scope();
++			statement("switch (i)");
++			begin_scope();
++			statement("case 0: indexOffset = 0; break;");
++			statement("case 1: indexOffset = 1; break;");
++			statement("case 2: indexOffset = 2; break;");
++			statement("case 3: indexOffset = 6; break;");
++			statement("case 4: indexOffset = 4; break;");
++			statement("case 5: indexOffset = 3; break;");
++			end_scope();
++			end_scope();
++			statement("else if ((positionInGrid.x & 1) != 0)");
++			begin_scope();
++			statement("switch (i)");
++			begin_scope();
++			statement("case 0: indexOffset = startingIndex + 2; break;");
++			statement("case 1: indexOffset = startingIndex - 2; break;");
++			statement("case 2: indexOffset = startingIndex; break;");
++			statement("case 3: indexOffset = startingIndex + 3; break;");
++			statement("case 4: indexOffset = startingIndex + 4; break;");
++			statement("case 5: indexOffset = startingIndex + (positionInGrid.x == int(threadgroupsPerGrid.x) - 1 ? 5 : 6); break;");
++			end_scope();
++			end_scope();
++			statement("else");
++			begin_scope();
++			statement("switch (i)");
++			begin_scope();
++			statement("case 0: indexOffset = startingIndex; break;");
++			statement("case 1: indexOffset = startingIndex - 2; break;");
++			statement("case 2: indexOffset = startingIndex + 2; break;");
++			statement("case 3: indexOffset = startingIndex + (positionInGrid.x == int(threadgroupsPerGrid.x) - 1 ? 5 : 6); break;");
++			statement("case 4: indexOffset = startingIndex + 4; break;");
++			statement("case 5: indexOffset = startingIndex + 3; break;");
++			end_scope();
++			end_scope();
++			end_scope();
++		}
++
++		statement("if (drawInfo->indexed)");
++		begin_scope();
++
++		statement(R"END(
++		if (drawInfo->indexSize == 1) {
++			vertexIndex = ((constant uchar *)drawInfo->indexBuffer)[indexOffset + drawInfo->firstVertex];
++		} else if (drawInfo->indexSize == 2) {
++			vertexIndex = ((constant ushort *)drawInfo->indexBuffer)[indexOffset + drawInfo->firstVertex];
++		} else {
++			vertexIndex = ((constant uint *)drawInfo->indexBuffer)[indexOffset + drawInfo->firstVertex];
++		})END");
++
++		end_scope();
++		if (msl_options.input_primitive_type == CompilerMSL::Options::PrimitiveTopology::TriangleFan)
++			statement("else vertexIndex = (i == 0 ? 0 : positionInGrid.x + i) + drawInfo->firstVertex;");
++		else if (msl_options.input_primitive_type == CompilerMSL::Options::PrimitiveTopology::TriangleStripAdjacency)
++			statement("else vertexIndex = indexOffset + drawInfo->firstVertex;");
++		else
++			statement("else vertexIndex = startingIndex + i + drawInfo->firstVertex;");
++		statement(R"END(
++		if (drawInfo->primitiveRestart && drawInfo->indexed) {
++			if ((drawInfo->indexSize == 1 && vertexIndex == 0xffu) ||
++			    (drawInfo->indexSize == 2 && vertexIndex == 0xffffu) ||
++			    (drawInfo->indexSize == 4 && vertexIndex == 0xffffffffu))
++				primitiveValid = false;
++		})END");
++		statement("if (drawInfo->indexed) vertexIndex += drawInfo->vertexOffset;");
++
++		if (stage_in_var_id) {
++			auto in_var_type = get_variable_data_type(get<SPIRVariable>(stage_in_var_id));
++			statement(type_to_glsl(in_var_type), " ", to_name(stage_in_var_id), ";");
++		}
++
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, SPIRVariable &var) {
++			if (var.storage != StorageClassInput)
++				return;
++
++			auto &type = get<SPIRType>(var.basetype);
++			if (has_decoration(type.self, DecorationBlock))
++				return;
++
++			if (!interface_variable_exists_in_entry_point(var.self))
++				return;
++
++			if (is_hidden_variable(var, true))
++				return;
++
++			if (is_builtin_variable(var))
++				return;
++
++			uint32_t location = get_decoration(id, DecorationLocation);
++
++			LocationComponentPair key;
++			key.location  = location;
++			key.component = 0;
++
++			auto payload_it = inputs_by_location.find(key);
++			if (payload_it == inputs_by_location.end())
++				return;
++
++			auto variable = payload_it->second;
++			std::string name = to_name(id);
++
++			SPIRType& parent_type = get<SPIRType>(type.parent_type);
++			std::string parent_type_str = type_to_glsl(get<SPIRType>(type.parent_type), var.self);
++			uint32_t load_elements = std::min<uint32_t>(variable.vecsize, parent_type.vecsize);
++			const char *index_name = variable.rate == MSL_SHADER_VARIABLE_RATE_PER_PRIMITIVE ? "instanceIndex" : "vertexIndex";
++
++			std::string type_name = get_variable_format_string(variable.format);
++			std::string component = type_name + get_vertex_loader_component_suffix(load_elements);
++			std::string packed = variable.vecsize > 1 ? "packed_" : "";
++			std::string load_string = "*(device " + packed + component + " *)(vb" + std::to_string(variable.binding) + " + " + std::to_string(variable.offset) + " + " + index_name + " * " + std::to_string(variable.stride) + ")";
++			if (load_elements != parent_type.vecsize) {
++				component = type_name + get_vertex_loader_component_suffix(parent_type.vecsize);
++				load_string = component + "(" + load_string;
++				for (uint32_t i = load_elements; i < parent_type.vecsize; i++)
++					load_string += (i == 3) ? ", 1" : ", 0";
++				load_string += ")";
++			}
++			if (parent_type_str != component)
++				load_string = parent_type_str + "(" + load_string + ")";
++			statement(to_name(var.self), " = ", load_string, get_normalization_string(variable.format, variable.normalized), ";");
++		});
++
++		statement(has_stage_output ? "payload.vertices[i] = " : "", execution.name, "(");
++		bool need_semicolon = false;
++		if (stage_in_var_id) {
++			need_semicolon = true;
++			statement(to_name(stage_in_var_id));
++		}
++
++		if (msl_options.argument_buffers) {
++			for (uint32_t i = 0; i < kMaxArgumentBuffers; ++i) {
++				if (!argument_buffer_ids[i]) continue;
++				statement(need_semicolon ? ", " : "", to_name(argument_buffer_ids[i]));
++				need_semicolon = true;
++			}
++		} else {
++			auto resources = get_sorted_entry_point_args(false);
++			for (auto &resource : resources) {
++				statement(need_semicolon ? ", " : "", resource.name);
++				need_semicolon = true;
++			}
++		}
++
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
++			if (var.storage == StorageClassInput && is_builtin_variable(var)) {
++				uint32_t builtin = get_decoration(var_id, DecorationBuiltIn);
++
++				switch (builtin) {
++				case BuiltInInstanceIndex: {
++					statement(need_semicolon ? ", " : "", "instanceIndex");
++					need_semicolon = true;
++					break;
++				}
++				case BuiltInBaseInstance: {
++					statement(need_semicolon ? ", " : "", "drawInfo->firstInstance");
++					need_semicolon = true;
++					break;
++				}
++				case BuiltInVertexIndex: {
++					statement(need_semicolon ? ", " : "", "vertexIndex");
++					need_semicolon = true;
++					break;
++				}
++				default: {
++					statement(need_semicolon ? ", " : "", "0 /* Unhandled builtin ", builtin, " */");
++					need_semicolon = true;
++				} break;
++				}
++			}
++		});
++
++		statement(");");
++
++		statement("uint32_t primitiveId = positionInGrid.x;");
++		statement("if (drawInfo->primitiveRestart && drawInfo->indexed)");
++		begin_scope();
++		statement("for (uint32_t primitive = 0; primitive < positionInGrid.x; ++primitive)");
++		begin_scope();
++		statement("bool restartPrimitiveValid = true;");
++		statement("for (int j = 0; j < vertexCount; ++j)");
++		begin_scope();
++		statement("int restartOffset = int(primitive) * ", std::to_string(primitive_topology_stride(msl_options.input_primitive_type)), " + j;");
++		statement("uint32_t restartIndex;");
++		statement(R"END(
++		if (drawInfo->indexSize == 1) {
++			restartIndex = ((constant uchar *)drawInfo->indexBuffer)[restartOffset + drawInfo->firstVertex];
++		} else if (drawInfo->indexSize == 2) {
++			restartIndex = ((constant ushort *)drawInfo->indexBuffer)[restartOffset + drawInfo->firstVertex];
++		} else {
++			restartIndex = ((constant uint *)drawInfo->indexBuffer)[restartOffset + drawInfo->firstVertex];
++		})END");
++		statement(R"END(
++		if ((drawInfo->indexSize == 1 && restartIndex == 0xffu) ||
++		    (drawInfo->indexSize == 2 && restartIndex == 0xffffu) ||
++		    (drawInfo->indexSize == 4 && restartIndex == 0xffffffffu))
++			restartPrimitiveValid = false;)END");
++		end_scope();
++		statement("if (!restartPrimitiveValid) --primitiveId;");
++		end_scope();
++		end_scope();
++		statement("payload.primitive_id = primitiveId;");
++
++		end_scope();
++		statement("if (!primitiveValid)");
++		begin_scope();
++		statement("meshGridProperties.set_threadgroups_per_grid(uint3(0, 1, 1));");
++		statement("return;");
++		end_scope();
++
++		statement("meshGridProperties.set_threadgroups_per_grid(uint3(", std::to_string(msl_options.geometry_invocations), ", 1, 1));");
++
++		end_scope();
++	} else {
++		assert(execution.model == ExecutionModelGeometry);
++		auto payload_member_name = [](const MSLShaderInterfaceVariable &variable) {
++			if (variable.builtin != BuiltInMax)
++				return join("builtin", std::to_string(variable.builtin));
++			return join("in", std::to_string(variable.location));
++		};
++
++		auto find_payload_variable = [&](bool builtin, uint32_t value) -> const MSLShaderInterfaceVariable * {
++			if (builtin) {
++				auto it = inputs_by_builtin.find(value);
++				return it == inputs_by_builtin.end() ? nullptr : &it->second;
++			}
++
++			LocationComponentPair key;
++			key.location = value;
++			key.component = 0;
++			auto it = inputs_by_location.find(key);
++			return it == inputs_by_location.end() ? nullptr : &it->second;
++		};
++
++		// Emit the payload struct
++		statement("struct Payload");
++		begin_scope();
++		statement("struct payload_vertex");
++		begin_scope();
++
++		for (auto kv: inputs_by_location) {
++			std::string type_name = get_variable_format_string(kv.second.type);
++			if (kv.second.vecsize) type_name += get_vertex_loader_component_suffix(kv.second.vecsize);
++			std::string field_name = payload_member_name(kv.second);
++			std::string attribute;
++
++			switch (kv.second.builtin) {
++				case BuiltInPosition:
++					attribute = "[[position]]";
++					break;
++				default:
++					fprintf(stderr, "Builtin not handled: %u\n", kv.second.builtin);
++				case BuiltInMax:
++					attribute = join("[[user(locn", std::to_string(kv.second.location), ")]]"); break;
++					break;
++			}
++
++			statement(join(type_name, " ", field_name, " ", attribute, ";"));
++		}
++
++		end_scope(";");
++
++		statement("uint32_t primitive_id;");
++		statement(join("payload_vertex vertices[", std::to_string(vertex_count_in_primitive(msl_options.input_primitive_type)), "];"));
++		end_scope(";");
++
++		// Mesh entry point.
++
++		statement("[[mesh]] void ", execution.name, "(mesh_stream_t::mesh_t outputMesh, const object_data Payload &payload [[payload]],");
++
++		// Geometry bindings
++
++		msl_options.for_mesh_pipeline = false;
++
++		string mesh_arguments;
++		if (msl_options.argument_buffers)
++			mesh_arguments = entry_point_args_argument_buffer(false, false, false, false);
++		else
++			entry_point_args_discrete_descriptors(mesh_arguments);
++		msl_options.for_mesh_pipeline = true;
++		if (!mesh_arguments.empty()) mesh_arguments += ",";
++		statement(mesh_arguments);
++
++		statement("uint lid [[thread_index_in_threadgroup]], uint3 tid [[threadgroup_position_in_grid]])");
++
++		begin_scope();
++
++		auto in_var_type = get_variable_data_type(get<SPIRVariable>(stage_in_var_id));
++		statement(type_to_glsl(in_var_type), " ", to_name(stage_in_var_id), ";");
++		statement("GeometryInput _RESERVED_IDENTIFIER_FIXUP_gl_in[", vertex_count_in_primitive(msl_options.input_primitive_type), "] = {};" );
++
++		for (uint32_t member = 0; member < uint32_t(in_var_type.member_types.size()); ++member)
++		{
++			if (!has_extended_member_decoration(in_var_type.self, member, SPIRVCrossDecorationInterfaceOrigID) ||
++			    !has_extended_member_decoration(in_var_type.self, member, SPIRVCrossDecorationInterfaceMemberIndex))
++			{
++				if (has_member_decoration(in_var_type.self, member, DecorationBuiltIn))
++				{
++					uint32_t builtin = get_member_decoration(in_var_type.self, member, DecorationBuiltIn);
++					const auto *payload = find_payload_variable(true, builtin);
++					if (payload)
++					{
++						auto &member_type = get<SPIRType>(in_var_type.member_types[member]);
++						if (is_array(member_type))
++						{
++							for (uint32_t vertex = 0; vertex < uint32_t(vertex_count_in_primitive(msl_options.input_primitive_type)); ++vertex)
++								statement(to_name(stage_in_var_id), ".", to_member_name(in_var_type, member), "[", vertex, "] = payload.vertices[",
++								          vertex, "].", payload_member_name(*payload), ";");
++						}
++						else
++							statement(to_name(stage_in_var_id), ".", to_member_name(in_var_type, member), " = payload.vertices[0].",
++							          payload_member_name(*payload), ";");
++					}
++					continue;
++				}
++
++				if (!has_member_decoration(in_var_type.self, member, DecorationLocation))
++					continue;
++
++				const auto *payload = find_payload_variable(false, get_member_decoration(in_var_type.self, member, DecorationLocation));
++				if (!payload)
++					continue;
++
++				auto &member_type = get<SPIRType>(in_var_type.member_types[member]);
++				if (is_array(member_type))
++				{
++					for (uint32_t vertex = 0; vertex < uint32_t(vertex_count_in_primitive(msl_options.input_primitive_type)); ++vertex)
++						statement(to_name(stage_in_var_id), ".", to_member_name(in_var_type, member), "[", vertex, "] = payload.vertices[",
++						          vertex, "].", payload_member_name(*payload), ";");
++				}
++				continue;
++			}
++
++			uint32_t orig_id = get_extended_member_decoration(in_var_type.self, member, SPIRVCrossDecorationInterfaceOrigID);
++			uint32_t interface_index = get_extended_member_decoration(in_var_type.self, member, SPIRVCrossDecorationInterfaceMemberIndex);
++			auto &orig_var = get<SPIRVariable>(orig_id);
++			auto &orig_type = get_variable_data_type(orig_var);
++			uint32_t element_size = 1;
++			if (is_array(orig_type))
++			{
++				auto &element_type = get_variable_element_type(orig_var);
++				if (element_type.basetype == SPIRType::Struct)
++					element_size = std::max(1u, uint32_t(element_type.member_types.size()));
++			}
++
++			bool builtin = has_member_decoration(in_var_type.self, member, DecorationBuiltIn);
++			uint32_t value = builtin ? get_member_decoration(in_var_type.self, member, DecorationBuiltIn) :
++			                            (has_decoration(orig_id, DecorationLocation) ? get_decoration(orig_id, DecorationLocation) : ~0u);
++			const auto *payload = value == ~0u ? nullptr : find_payload_variable(builtin, value);
++			if (!payload)
++				continue;
++
++			uint32_t vertex = interface_index / element_size;
++			if (vertex >= uint32_t(vertex_count_in_primitive(msl_options.input_primitive_type)))
++				continue;
++			statement(to_name(stage_in_var_id), ".", to_member_name(in_var_type, member), " = payload.vertices[", vertex, "].",
++			          payload_member_name(*payload), ";");
++		}
++
++		std::set<uint32_t> emitted_builtins;
++		for (uint32_t member = 0; member < uint32_t(in_var_type.member_types.size()); ++member)
++		{
++			if (!has_member_decoration(in_var_type.self, member, DecorationBuiltIn))
++				continue;
++
++			uint32_t builtin = get_member_decoration(in_var_type.self, member, DecorationBuiltIn);
++			if (!emitted_builtins.insert(builtin).second)
++				continue;
++
++			const auto *payload = find_payload_variable(true, builtin);
++			if (!payload)
++				continue;
++
++			for (uint32_t vertex = 0; vertex < uint32_t(vertex_count_in_primitive(msl_options.input_primitive_type)); ++vertex)
++				statement("_RESERVED_IDENTIFIER_FIXUP_gl_in[", vertex, "].out.", to_member_name(in_var_type, member),
++				          " = payload.vertices[", vertex, "].", payload_member_name(*payload), ";");
++		}
++
++		statement(join(execution.name, "(outputMesh, ", to_name(stage_in_var_id), ", _RESERVED_IDENTIFIER_FIXUP_gl_in"));
++
++		if (msl_options.argument_buffers) {
++			for (uint32_t i = 0; i < kMaxArgumentBuffers; ++i) {
++				if (argument_buffer_ids[i])
++					statement(", ", to_name(argument_buffer_ids[i]));
++			}
++		} else {
++			ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
++				if ((var.storage == StorageClassUniform || var.storage == StorageClassUniformConstant ||
++				     var.storage == StorageClassPushConstant || var.storage == StorageClassStorageBuffer) &&
++				    !is_hidden_variable(var))
++				{
++					statement(", ", to_name(var_id)); // TODO sort? they're sorted in entry_point_args_discrete_descriptors.
++				}
++			});
++		}
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
++			if (var.storage != StorageClassInput || !is_builtin_variable(var))
++				return;
++
++			uint32_t builtin = get_decoration(var_id, DecorationBuiltIn);
++			if (!active_input_builtins.get(builtin) || !interface_variable_exists_in_entry_point(var_id) ||
++			    !is_direct_input_builtin(BuiltIn(builtin)) || get_variable_data_type(var).basetype == SPIRType::Struct)
++				return;
++
++			switch (builtin) {
++			case BuiltInInvocationId:
++				statement(", tid.x");
++				break;
++			case BuiltInPrimitiveId:
++				statement(", payload.primitive_id");
++				break;
++			default:
++				statement(", 0 /* Unhandled builtin ", builtin, " */");
++				break;
++			}
++		});
++		statement(");");
++		end_scope();
++	}
++}
++
++
+ string CompilerMSL::compile()
+ {
++	fprintf(stderr, "Compiling with MSL version %u\n", msl_options.msl_version);
+ 	replace_illegal_entry_point_names();
++
+ 	ir.fixup_reserved_names();
+ 
+ 	// Do not deal with GLES-isms like precision, older extensions and such.
+@@ -1789,6 +2440,8 @@
+ 	if (builtin_frag_depth_id)
+ 		add_active_interface_variable(builtin_frag_depth_id);
+ 
++	auto &execution = get_entry_point();
++
+ 	// Create structs to hold input, output and uniform variables.
+ 	// Do output first to ensure out. is declared at top of entry function.
+ 	qual_pos_var_name = "";
+@@ -1800,16 +2453,17 @@
+ 	else
+ 	{
+ 		stage_out_var_id = add_interface_block(StorageClassOutput);
++		if (execution.model == ExecutionModelGeometry)
++			stage_out_mesh_primitive_var_id = add_interface_block(StorageClassOutput, false, true);
+ 		patch_stage_out_var_id = add_interface_block(StorageClassOutput, true);
+ 		stage_in_var_id = add_interface_block(StorageClassInput);
+ 	}
+-
+ 	if (is_tese_shader())
+ 		patch_stage_in_var_id = add_interface_block(StorageClassInput, true);
+ 
+ 	if (is_tesc_shader())
+ 		stage_out_ptr_var_id = add_interface_block_pointer(stage_out_var_id, StorageClassOutput);
+-	if (is_tessellation_shader())
++	if (is_tessellation_shader() || execution.model == ExecutionModelGeometry)
+ 		stage_in_ptr_var_id = add_interface_block_pointer(stage_in_var_id, StorageClassInput);
+ 
+ 	if (is_mesh_shader())
+@@ -1834,6 +2488,14 @@
+ 	// the loop, so the hooks aren't added multiple times.
+ 	fix_up_shader_inputs_outputs();
+ 
++	if (execution.model == ExecutionModelGeometry) {
++		auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
++
++		entry_func.fixup_hooks_in.push_back([=]() {
++			statement("mesh_stream_t meshStream(spvMeshOut, ", to_name(stage_out_var_id),", ", to_name(stage_out_mesh_primitive_var_id) ,");");
++		});
++	}
++
+ 	// If we are using argument buffers, we create argument buffer structures for them here.
+ 	// These buffers will be used in the entry point, not the individual resources.
+ 	if (msl_options.argument_buffers)
+@@ -1857,14 +2519,31 @@
+ 
+ 		// Move constructor for this type is broken on GCC 4.9 ...
+ 		buffer.reset();
++		if (execution.model == ExecutionModelGeometry && msl_options.for_mesh_pipeline)
++			spv_function_implementations.insert(SPVFuncImplEmitVertex);
+ 
+ 		emit_header();
+ 		emit_custom_templates();
+ 		emit_custom_functions();
+ 		emit_specialization_constants_and_structs();
+ 		emit_resources();
++
++		if (execution.model == ExecutionModelGeometry) {
++			auto output_primitives = geometry_output_primitive_count(execution);
++
++			auto vertex_type = type_to_glsl(get_variable_data_type(get<SPIRVariable>(stage_out_var_id)));
++			auto prim_type = type_to_glsl(get_variable_data_type(get<SPIRVariable>(stage_out_mesh_primitive_var_id)));
++
++			statement("enum { VERTEX_COUNT = ", std::to_string(execution.output_vertices), ", PRIMITIVE_COUNT = ", std::to_string(output_primitives), "};");
++			statement("using mesh_stream_t = spvMeshStream<", vertex_type, ", ", prim_type, ", VERTEX_COUNT, PRIMITIVE_COUNT, metal::topology::", geometry_output_topology(execution), ", ", geometry_output_is_strip(execution) ? "true" : "false", ">;");
++		}
++
+ 		emit_function(get<SPIRFunction>(ir.default_entry_point), Bitset());
+ 
++		if (msl_options.for_mesh_pipeline) {
++			emit_mesh_wrapper();
++		}
++
+ 		pass_count++;
+ 	} while (is_forcing_recompilation());
+ 
+@@ -2399,6 +3078,9 @@
+ 					p_type->basetype == SPIRType::Struct;
+ 			bool is_redirected_to_global_stage_io = (is_control_point_storage || is_patch_block_storage) &&
+ 			                                        variable_is_stage_io;
++			if (msl_options.for_mesh_pipeline && get_execution_model() == ExecutionModelGeometry && var.storage == StorageClassInput &&
++			    (get_name(var.self) == "gl_in" || get_name(var.self) == "_RESERVED_IDENTIFIER_FIXUP_gl_in"))
++				is_redirected_to_global_stage_io = true;
+ 
+ 			// If output is masked it is not considered part of the global stage IO interface.
+ 			if (is_redirected_to_global_stage_io && var.storage == StorageClassOutput)
+@@ -3983,7 +4665,6 @@
+ 					builtin = BuiltInMax;
+ 					is_builtin = is_member_builtin(var_type, mbr_idx, &builtin);
+ 					auto &mbr_type = get<SPIRType>(var_type.member_types[mbr_idx]);
+-
+ 					if (storage == StorageClassOutput && is_stage_output_block_member_masked(var, mbr_idx, meta.strip_array))
+ 					{
+ 						location = UINT32_MAX; // Skip this member and resolve location again on next var member
+@@ -4100,7 +4781,7 @@
+ 				is_builtin = false;
+ 
+ 			// MSL does not allow matrices or arrays in input or output variables, so need to handle it specially.
+-			if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
++			if (!msl_options.for_mesh_pipeline && (!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
+ 			{
+ 				add_composite_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
+ 			}
+@@ -4197,11 +4878,11 @@
+ 
+ // Add an interface structure for the type of storage, which is either StorageClassInput or StorageClassOutput.
+ // Returns the ID of the newly added variable, or zero if no variable was added.
+-uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
++uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch, bool mesh_primitive)
+ {
+ 	// Accumulate the variables that should appear in the interface struct.
+ 	SmallVector<SPIRVariable *> vars;
+-	bool incl_builtins = storage == StorageClassOutput || is_tessellation_shader();
++	bool incl_builtins = storage == StorageClassOutput || is_tessellation_shader() || get_execution_model() == ExecutionModelGeometry;
+ 	bool has_seen_barycentric = false;
+ 
+ 	InterfaceBlockMeta meta;
+@@ -4243,6 +4924,24 @@
+ 		                               bi_type == BuiltInFragDepth ||
+ 		                               bi_type == BuiltInFragStencilRefEXT || bi_type == BuiltInSampleMask;
+ 
++		bool force_not_hidden = false;
++
++		if (get_execution_model() == ExecutionModelGeometry)
++		{
++			if (msl_options.for_mesh_pipeline && storage == StorageClassOutput && is_builtin &&
++			    bi_type == BuiltInPointSize && !get_entry_point().flags.get(ExecutionModeOutputPoints))
++				return;
++
++			if (is_builtin && bi_type == BuiltInPosition && storage == StorageClassInput) {
++				force_not_hidden = true;
++			}
++
++			if (mesh_primitive && (!is_builtin || !builtin_is_per_primitive_mesh_output(bi_type)))
++				return;
++
++			if (!mesh_primitive && is_builtin && builtin_is_per_primitive_mesh_output(bi_type))  return;
++		}
++
+ 		// These builtins are part of the stage in/out structs.
+ 		bool is_interface_block_builtin =
+ 		    builtin_is_stage_in_out || (is_tese_shader() && !msl_options.raw_buffer_tese_input &&
+@@ -4267,7 +4966,7 @@
+ 
+ 		bool filter_patch_decoration = (has_decoration(var_id, DecorationPatch) || is_patch_block(type)) == patch;
+ 
+-		bool hidden = is_hidden_variable(var, incl_builtins);
++		bool hidden = is_hidden_variable(var, incl_builtins) && !force_not_hidden;
+ 
+ 		// ClipDistance is never hidden, we need to emulate it when used as an input.
+ 		if (bi_type == BuiltInClipDistance || bi_type == BuiltInCullDistance)
+@@ -4363,7 +5062,8 @@
+ 	// If no variables qualify, leave.
+ 	// For patch input in a tessellation evaluation shader, the per-vertex stage inputs
+ 	// are included in a special patch control point array.
+-	if (vars.empty() &&
++	bool allow_empty_geometry_block = get_execution_model() == ExecutionModelGeometry && !patch;
++	if (vars.empty() && !allow_empty_geometry_block &&
+ 	    !(!msl_options.raw_buffer_tese_input && storage == StorageClassInput && patch && stage_in_var_id))
+ 		return 0;
+ 
+@@ -4376,6 +5076,41 @@
+ 	ib_type.basetype = SPIRType::Struct;
+ 	ib_type.storage = storage;
+ 	set_decoration(ib_type_id, DecorationBlock);
++	bool has_position_output = false;
++	for (auto *var : vars)
++	{
++		if (is_builtin_variable(*var) && get_decoration(var->self, DecorationBuiltIn) == BuiltInPosition)
++			has_position_output = true;
++
++		auto &var_type = get_variable_element_type(*var);
++		if (var_type.basetype == SPIRType::Struct)
++		{
++			for (uint32_t member = 0; member < uint32_t(var_type.member_types.size()); ++member)
++			{
++				if (has_member_decoration(var_type.self, member, DecorationBuiltIn) &&
++				    get_member_decoration(var_type.self, member, DecorationBuiltIn) == BuiltInPosition)
++					has_position_output = true;
++			}
++		}
++	}
++	if (mesh_primitive) {
++		uint32_t member = uint32_t(ib_type.member_types.size());
++		ib_type.member_types.push_back(get_uint_type_id());
++		set_member_name(ib_type.self, member, "primitive_id");
++		set_member_decoration(ib_type.self, member, DecorationBuiltIn, BuiltInPrimitiveId);
++	}
++	if (allow_empty_geometry_block && storage == StorageClassOutput && !mesh_primitive && !has_position_output) {
++		uint32_t type_id = ir.increase_bound_by(1);
++		SPIRType position_type { OpTypeVector };
++		position_type.basetype = SPIRType::Float;
++		position_type.width = 32;
++		position_type.vecsize = 4;
++		set<SPIRType>(type_id, position_type);
++		uint32_t member = uint32_t(ib_type.member_types.size());
++		ib_type.member_types.push_back(type_id);
++		set_member_name(ib_type.self, member, "gl_Position");
++		set_member_decoration(ib_type.self, member, DecorationBuiltIn, BuiltInPosition);
++	}
+ 
+ 	uint32_t ib_var_id = next_id++;
+ 	auto &var = set<SPIRVariable>(ib_var_id, ib_type_id, storage, 0);
+@@ -4467,7 +5202,10 @@
+ 				auto &blk = get<SPIRBlock>(blk_id);
+ 				auto last_blk_return = blk.terminator == SPIRBlock::Kill || blk.terminator == SPIRBlock::Unreachable;
+ 				if (blk.terminator == SPIRBlock::Return || (last_blk_return && blk_id == entry_func.blocks.back()))
+-					blk.return_value = rtn_id;
++				{
++					if (get_execution_model() != ExecutionModelGeometry)
++						blk.return_value = rtn_id;
++				}
+ 			}
+ 			vars_needing_early_declaration.push_back(ib_var_id);
+ 		}
+@@ -4608,11 +5346,11 @@
+ 			switch (input.second.format)
+ 			{
+ 			case MSL_SHADER_VARIABLE_FORMAT_UINT16:
+-			case MSL_SHADER_VARIABLE_FORMAT_ANY16:
++			case MSL_SHADER_VARIABLE_FORMAT_INT16:
++			case MSL_SHADER_VARIABLE_FORMAT_HALF:
+ 				type.basetype = SPIRType::UShort;
+ 				type.width = 16;
+ 				break;
+-			case MSL_SHADER_VARIABLE_FORMAT_ANY32:
+ 			default:
+ 				type.basetype = SPIRType::UInt;
+ 				type.width = 32;
+@@ -4676,11 +5414,11 @@
+ 			switch (output.second.format)
+ 			{
+ 			case MSL_SHADER_VARIABLE_FORMAT_UINT16:
+-			case MSL_SHADER_VARIABLE_FORMAT_ANY16:
++			case MSL_SHADER_VARIABLE_FORMAT_INT16:
++			case MSL_SHADER_VARIABLE_FORMAT_HALF:
+ 				type.basetype = SPIRType::UShort;
+ 				type.width = 16;
+ 				break;
+-			case MSL_SHADER_VARIABLE_FORMAT_ANY32:
+ 			default:
+ 				type.basetype = SPIRType::UInt;
+ 				type.width = 32;
+@@ -4785,7 +5523,22 @@
+ 	uint32_t ib_ptr_var_id;
+ 	uint32_t next_id = ir.increase_bound_by(3);
+ 	auto &ib_type = expression_type(ib_var_id);
+-	if (is_tesc_shader() || (is_tese_shader() && msl_options.raw_buffer_tese_input))
++	if (get_execution_model() == ExecutionModelGeometry && storage == StorageClassInput)
++	{
++		uint32_t geometry_ptr_type_id = next_id++;
++		auto &geometry_ptr_type = set<SPIRType>(geometry_ptr_type_id, get_variable_data_type(get<SPIRVariable>(ib_var_id)));
++		geometry_ptr_type.op = OpTypePointer;
++		geometry_ptr_type.parent_type = geometry_ptr_type.type_alias = ib_type.self;
++		geometry_ptr_type.pointer = true;
++		geometry_ptr_type.pointer_depth++;
++		geometry_ptr_type.storage = StorageClassFunction;
++
++		ib_ptr_var_id = next_id;
++		set<SPIRVariable>(ib_ptr_var_id, geometry_ptr_type_id, StorageClassFunction, 0);
++		set_name(ib_ptr_var_id, "_RESERVED_IDENTIFIER_FIXUP_gl_in");
++		set_decoration(ib_ptr_var_id, DecorationNonWritable);
++	}
++	else if (is_tesc_shader() || (is_tese_shader() && msl_options.raw_buffer_tese_input))
+ 	{
+ 		// Tessellation control per-vertex I/O is presented as an array, so we must
+ 		// do the same with our struct here.
+@@ -4981,6 +5734,26 @@
+ 		}
+ 	}
+ 
++	case MSL_SHADER_VARIABLE_FORMAT_UINT32:
++	{
++		switch (type.basetype)
++		{
++		case SPIRType::UShort:
++		case SPIRType::UInt:
++			if (num_components > type.vecsize)
++				return build_extended_vector_type(type_id, num_components);
++			else
++				return type_id;
++
++		case SPIRType::Int:
++			return build_extended_vector_type(type_id, num_components > type.vecsize ? num_components : type.vecsize,
++			                                  SPIRType::UInt);
++
++		default:
++			SPIRV_CROSS_THROW("Vertex attribute type mismatch between host and shader");
++		}
++	}
++
+ 	default:
+ 		if (num_components > type.vecsize)
+ 			type_id = build_extended_vector_type(type_id, num_components);
+@@ -5810,8 +6583,10 @@
+ 	if (!pragma_lines.empty())
+ 		statement("");
+ 
+-	statement("#include <metal_stdlib>");
+-	statement("#include <simd/simd.h>");
++	if (!msl_options.for_mesh_pipeline) {
++		statement("#include <metal_stdlib>");
++		statement("#include <simd/simd.h>");
++	}
+ 
+ 	for (auto &header : header_lines)
+ 		statement(header);
+@@ -6027,6 +6802,93 @@
+ 			statement("");
+ 			break;
+ 
++		case SPVFuncImplEmitVertex:
++			statement("template<typename V, typename P, int MaxV, int MaxP, metal::topology T, bool Strip>");
++			statement("struct spvMeshStream");
++			begin_scope();
++
++			statement("using mesh_t = metal::mesh<V, P, MaxV, MaxP, T>;");
++			statement("thread mesh_t &meshOut;");
++
++			statement("int currentVertex = 0;");
++			statement("int currentIndex = 0;");
++			statement("int currentVertexInPrimitive = 0;");
++			statement("int currentPrimitive = 0;");
++			statement("thread P &primitiveData;");
++			statement("thread V &vertexData;");
++
++			statement("spvMeshStream(thread mesh_t &_meshOut, thread V &_v, thread P &_p) : meshOut(_meshOut), primitiveData(_p), vertexData(_v)");
++			begin_scope();
++			statement("meshOut.set_primitive_count(0);");
++			end_scope();
++
++			statement("~spvMeshStream()");
++			begin_scope();
++			statement("meshOut.set_primitive_count(currentPrimitive);");
++			end_scope();
++
++			statement("int VperP()");
++			begin_scope();
++			statement("if (T == metal::topology::triangle)          return 3;");
++			statement("else if (T == metal::topology::line)         return 2;");
++			statement("else /* if (T == metal::topology::point) */  return 1;");
++			end_scope();
++
++			statement("void EndPrimitive()");
++			begin_scope();
++			statement("currentVertexInPrimitive = 0;");
++			end_scope();
++
++			statement("void EmitVertex()");
++			begin_scope();
++			if (options.vertex.flip_vert_y) {
++				statement("V v = vertexData;");
++				statement("v.gl_Position.y = -v.gl_Position.y; // Invert Y-axis for Metal");
++				statement("meshOut.set_vertex(currentVertex++, v);");
++			} else {
++				statement("meshOut.set_vertex(currentVertex++, vertexData);");
++			}
++			statement("currentVertexInPrimitive++;");
++			statement("if (Strip)");
++			begin_scope();
++			statement("if (T == metal::topology::line && currentVertexInPrimitive >= 2)");
++			begin_scope();
++			statement("meshOut.set_index(currentIndex++, currentVertex-2);");
++			statement("meshOut.set_index(currentIndex++, currentVertex-1);");
++			statement("meshOut.set_primitive(currentPrimitive++, primitiveData);");
++			end_scope();
++			statement("if (T == metal::topology::triangle && currentVertexInPrimitive >= 3)");
++			begin_scope();
++			statement("if ((currentVertexInPrimitive & 1) != 0)");
++			begin_scope();
++			statement("meshOut.set_index(currentIndex++, currentVertex-3);");
++			statement("meshOut.set_index(currentIndex++, currentVertex-2);");
++			end_scope();
++			statement("else");
++			begin_scope();
++			statement("meshOut.set_index(currentIndex++, currentVertex-2);");
++			statement("meshOut.set_index(currentIndex++, currentVertex-3);");
++			end_scope();
++			statement("meshOut.set_index(currentIndex++, currentVertex-1);");
++			statement("meshOut.set_primitive(currentPrimitive++, primitiveData);");
++			end_scope();
++			statement("if (T == metal::topology::point)");
++			begin_scope();
++			statement("meshOut.set_primitive(currentPrimitive++, primitiveData);");
++			end_scope();
++			end_scope();
++			statement("else if (currentVertexInPrimitive >= VperP())");
++			begin_scope();
++			statement("if (T == metal::topology::triangle) meshOut.set_index(currentIndex++, currentVertex-3);");
++			statement("if (T == metal::topology::triangle || T == metal::topology::line) meshOut.set_index(currentIndex++, currentVertex-2);");
++			statement("meshOut.set_index(currentIndex++, currentVertex-1);");
++			statement("meshOut.set_primitive(currentPrimitive++, primitiveData);");
++			end_scope();
++			end_scope();
++			end_scope(";");
++
++			break;
++
+ 		default:
+ 			break;
+ 		}
+@@ -8415,9 +9277,39 @@
+ 
+ 	// Emit the special [[stage_in]] and [[stage_out]] interface blocks which we created.
+ 	emit_interface_block(stage_out_var_id);
++	if (stage_out_mesh_primitive_var_id)
++		emit_interface_block(stage_out_mesh_primitive_var_id);
+ 	emit_interface_block(patch_stage_out_var_id);
+ 	emit_interface_block(stage_in_var_id);
+ 	emit_interface_block(patch_stage_in_var_id);
++	if (get_execution_model() == ExecutionModelGeometry && msl_options.for_mesh_pipeline)
++	{
++		statement("struct GeometryInput");
++		begin_scope();
++		statement("struct GeometryVertex");
++		begin_scope();
++
++		std::set<uint32_t> emitted_builtins;
++		auto &stage_in_type = get_stage_in_struct_type();
++		for (uint32_t member = 0; member < uint32_t(stage_in_type.member_types.size()); ++member)
++		{
++			if (!has_member_decoration(stage_in_type.self, member, DecorationBuiltIn))
++				continue;
++
++			uint32_t builtin = get_member_decoration(stage_in_type.self, member, DecorationBuiltIn);
++			if (!emitted_builtins.insert(builtin).second)
++				continue;
++
++			auto *member_type = &get<SPIRType>(stage_in_type.member_types[member]);
++			if (is_array(*member_type))
++				member_type = &get<SPIRType>(member_type->parent_type);
++			statement(type_to_glsl(*member_type), " ",
++			          to_member_name(stage_in_type, member), ";");
++		}
++
++		end_scope(" out;");
++		end_scope(";");
++	}
+ 
+ 	if (get_execution_model() == ExecutionModelMeshEXT)
+ 	{
+@@ -9017,6 +9909,52 @@
+ 
+ bool CompilerMSL::emit_tessellation_access_chain(const uint32_t *ops, uint32_t length)
+ {
++	if (msl_options.for_mesh_pipeline && get_execution_model() == ExecutionModelGeometry)
++	{
++		auto *var = maybe_get_backing_variable(ops[2]);
++		if (!var || var->storage != StorageClassInput || !is_builtin_variable(*var))
++			return false;
++
++		auto &var_type = get_variable_data_type(*var);
++		if (!is_array(var_type) || length < 5)
++			return false;
++
++		auto *member_index = maybe_get<SPIRConstant>(ops[4]);
++		if (!member_index)
++			return false;
++
++		auto &element_type = get<SPIRType>(var_type.parent_type);
++		uint32_t member = member_index->scalar();
++		if (member >= element_type.member_types.size())
++			return false;
++
++		auto &stage_type = get_variable_data_type(get<SPIRVariable>(stage_in_var_id));
++		uint32_t stage_member = uint32_t(-1);
++		for (uint32_t i = 0; i < uint32_t(stage_type.member_types.size()); ++i)
++		{
++			if (has_extended_member_decoration(stage_type.self, i, SPIRVCrossDecorationInterfaceOrigID) &&
++			    get_extended_member_decoration(stage_type.self, i, SPIRVCrossDecorationInterfaceOrigID) == var->self &&
++			    has_extended_member_decoration(stage_type.self, i, SPIRVCrossDecorationInterfaceMemberIndex) &&
++			    get_extended_member_decoration(stage_type.self, i, SPIRVCrossDecorationInterfaceMemberIndex) == member)
++			{
++				stage_member = i;
++				break;
++			}
++		}
++
++		if (stage_member == uint32_t(-1))
++			return false;
++
++		string expr = join(to_name(stage_in_ptr_var_id), "[", to_expression(ops[3]), "].out.",
++		                  to_member_name(stage_type, stage_member));
++		auto &result = set<SPIRExpression>(ops[1], std::move(expr), ops[0], should_forward(ops[2]));
++		result.loaded_from = var->self;
++		result.access_chain = true;
++		inherit_expression_dependencies(ops[1], ops[3]);
++		inherit_expression_dependencies(ops[1], ops[4]);
++		return true;
++	}
++
+ 	// If this is a per-vertex output, remap it to the I/O array buffer.
+ 
+ 	// Any object which did not go through IO flattening shenanigans will go there instead.
+@@ -10126,7 +11064,8 @@
+ 	case OpInBoundsAccessChain:
+ 	case OpAccessChain:
+ 	case OpPtrAccessChain:
+-		if (is_tessellation_shader())
++		if (is_tessellation_shader() ||
++		    (msl_options.for_mesh_pipeline && get_execution_model() == ExecutionModelGeometry))
+ 		{
+ 			if (!emit_tessellation_access_chain(ops, instruction.length))
+ 				CompilerGLSL::emit_instruction(instruction);
+@@ -10923,6 +11862,19 @@
+ 		break;
+ 	}
+ 
++	case OpEmitVertex:
++	{
++		add_spv_func_and_recompile(SPVFuncImplEmitVertex);
++		statement("meshStream.EmitVertex();");
++		break;
++	}
++
++	case OpEndPrimitive:
++	{
++		add_spv_func_and_recompile(SPVFuncImplEmitVertex);
++		statement("meshStream.EndPrimitive();");
++		break;
++	}
+ 	default:
+ 	{
+ 		// Prevent GLSL cooperative matrix code from leaking into MSL output.
+@@ -12158,6 +13110,13 @@
+ 
+ 	if (processing_entry_point)
+ 	{
++		auto &execution = get_entry_point();
++		if (execution.model == ExecutionModelGeometry) {
++			auto output_primitives = execution.output_primitives;
++			if (!output_primitives) output_primitives = execution.output_vertices - 2;
++			decl += "mesh_stream_t::mesh_t spvMeshOut, ";
++		}
++
+ 		if (msl_options.argument_buffers)
+ 			decl += entry_point_args_argument_buffer(!func.arguments.empty());
+ 		else
+@@ -12267,10 +13226,22 @@
+ 			decl += ", ";
+ 	}
+ 
++	if (func.self != ir.default_entry_point && get_entry_point().model == ExecutionModelGeometry &&
++	    msl_options.for_mesh_pipeline)
++		decl += join(func.arguments.empty() ? "" : ", ", "thread mesh_stream_t &meshStream");
++
+ 	decl += ")";
+ 	statement(decl);
+ }
+ 
++void CompilerMSL::append_global_func_args(const SPIRFunction &func, uint32_t index, SmallVector<string> &arglist)
++{
++	CompilerGLSL::append_global_func_args(func, index, arglist);
++	if (func.self != ir.default_entry_point && get_entry_point().model == ExecutionModelGeometry &&
++	    msl_options.for_mesh_pipeline)
++		arglist.push_back("meshStream");
++}
++
+ static bool needs_chroma_reconstruction(const MSLConstexprSampler *constexpr_sampler)
+ {
+ 	// For now, only multiplanar images need explicit reconstruction. GBGR and BGRG images
+@@ -13544,7 +14515,9 @@
+ {
+ 	if (stage_out_var_id && !capture_output_to_buffer)
+ 	{
+-		if (needs_point_size_output && !writes_to_point_size)
++		bool point_size_output = get_execution_model() != ExecutionModelGeometry ||
++		                         get_entry_point().flags.get(ExecutionModeOutputPoints);
++		if (needs_point_size_output && !writes_to_point_size && point_size_output)
+ 			statement(builtin_to_glsl(BuiltInPointSize, StorageClassOutput), " = ", format_float(msl_options.default_point_size), ";");
+ 
+ 		if (is_vertex_like_shader() && !qual_pos_var_name.empty())
+@@ -13824,6 +14797,9 @@
+ 
+ 	BuiltIn builtin = BuiltInMax;
+ 	bool is_builtin = is_member_builtin(type, index, &builtin);
++	if (is_builtin && builtin == BuiltInPosition && execution.model == ExecutionModelGeometry &&
++	    type.storage == StorageClassInput && msl_options.for_mesh_pipeline)
++		return "";
+ 
+ 	if (has_extended_member_decoration(type.self, index, SPIRVCrossDecorationResourceIndexPrimary))
+ 	{
+@@ -13851,6 +14827,9 @@
+ 			case BuiltInBaseInstance:
+ 				if (msl_options.vertex_for_tessellation)
+ 					return "";
++				if (msl_options.for_mesh_pipeline)
++					return string(" /*[[") + builtin_qualifier(builtin) + "]]*/";
++
+ 				return string(" [[") + builtin_qualifier(builtin) + "]]";
+ 
+ 			default:
+@@ -13864,21 +14843,31 @@
+ 		else
+ 			locn = get_member_location(type.self, index);
+ 
+-		if (locn != k_unknown_location)
++		if (locn != k_unknown_location) {
++			if (msl_options.for_mesh_pipeline)
++				return string(" /*[[attribute(") + convert_to_string(locn) + ")]]*/";
+ 			return string(" [[attribute(") + convert_to_string(locn) + ")]]";
++		}
++
++
++		if (msl_options.for_mesh_pipeline)
++			return "";
+ 	}
+ 
+ 	bool use_semantic_stage_output = is_mesh_shader() || is_tese_shader() ||
+ 	                                 (execution.model == ExecutionModelVertex && !msl_options.vertex_for_tessellation);
+ 
+-	// Vertex, mesh and tessellation evaluation function outputs
+-	if ((type.storage == StorageClassOutput || is_mesh_shader()) && use_semantic_stage_output)
++	// Vertex and tessellation evaluation function outputs
++	if ((type.storage == StorageClassOutput || is_mesh_shader() || execution.model == ExecutionModelGeometry) &&
++	    (use_semantic_stage_output || execution.model == ExecutionModelGeometry))
+ 	{
+ 		if (is_builtin)
+ 		{
+ 			switch (builtin)
+ 			{
+ 			case BuiltInPointSize:
++				if (execution.model == ExecutionModelGeometry && !execution.flags.get(ExecutionModeOutputPoints))
++					return "";
+ 				// Only mark the PointSize builtin if really rendering points.
+ 				// Some shaders may include a PointSize builtin even when used to render
+ 				// non-point topologies, and Metal will reject this builtin when compiling
+@@ -14340,6 +15329,10 @@
+ // entry type if the current function is the entry point function
+ string CompilerMSL::func_type_decl(SPIRType &type)
+ {
++	auto &execution = get_entry_point();
++	if (execution.model == ExecutionModelGeometry)
++		return "void";
++
+ 	// The regular function return type. If not processing the entry point function, that's all we need
+ 	string return_type = type_to_glsl(type) + type_to_array_glsl(type, 0);
+ 	if (!processing_entry_point)
+@@ -14351,10 +15344,15 @@
+ 
+ 	// Prepend a entry type, based on the execution model
+ 	string entry_type;
+-	auto &execution = get_entry_point();
+ 	switch (execution.model)
+ 	{
+ 	case ExecutionModelVertex:
++		if (msl_options.for_mesh_pipeline) {
++			if (!msl_options.supports_msl_version(2, 4))
++				SPIRV_CROSS_THROW("Mesh pipelines require MSL 2.4.");
++			entry_type = "";
++			break;
++		}
+ 		if (msl_options.vertex_for_tessellation && !msl_options.supports_msl_version(1, 2))
+ 			SPIRV_CROSS_THROW("Tessellation requires Metal 1.2.");
+ 		entry_type = msl_options.vertex_for_tessellation ? "kernel" : "vertex";
+@@ -14394,6 +15392,9 @@
+ 		break;
+ 	}
+ 
++	if (entry_type.empty())
++		return return_type;
++
+ 	return entry_type + " " + return_type;
+ }
+ 
+@@ -14640,7 +15641,9 @@
+ 		auto &type = get_variable_data_type(var);
+ 
+ 		add_resource_name(var.self);
+-		decl = join(type_to_glsl(type), " ", to_name(var.self), " [[stage_in]]");
++		decl = join(type_to_glsl(type), " ", to_name(var.self));
++		if (!msl_options.for_mesh_pipeline)
++			decl += " [[stage_in]]";
+ 	}
+ 
+ 	return decl;
+@@ -14659,7 +15662,8 @@
+ 	case BuiltInInstanceId:
+ 	case BuiltInInstanceIndex:
+ 	case BuiltInBaseInstance:
+-		return get_execution_model() != ExecutionModelVertex || !msl_options.vertex_for_tessellation;
++		return get_execution_model() != ExecutionModelVertex || !msl_options.vertex_for_tessellation ||
++		       msl_options.for_mesh_pipeline;
+ 	// Tess. control function in
+ 	case BuiltInPosition:
+ 	case BuiltInPointSize:
+@@ -14763,16 +15767,19 @@
+ 				else
+ 					ep_args += builtin_type_decl(bi_type, var_id) + " " + to_expression(var_id);
+ 
+-				ep_args += string(" [[") + builtin_qualifier(bi_type);
+-				if (bi_type == BuiltInSampleMask && get_entry_point().flags.get(ExecutionModePostDepthCoverage))
++				if (!msl_options.for_mesh_pipeline)
+ 				{
+-					if (!msl_options.supports_msl_version(2))
+-						SPIRV_CROSS_THROW("Post-depth coverage requires MSL 2.0.");
+-					if (msl_options.is_macos() && !msl_options.supports_msl_version(2, 3))
+-						SPIRV_CROSS_THROW("Post-depth coverage on Mac requires MSL 2.3.");
+-					ep_args += ", post_depth_coverage";
++					ep_args += string(" [[") + builtin_qualifier(bi_type);
++					if (bi_type == BuiltInSampleMask && get_entry_point().flags.get(ExecutionModePostDepthCoverage))
++					{
++						if (!msl_options.supports_msl_version(2))
++							SPIRV_CROSS_THROW("Post-depth coverage requires MSL 2.0.");
++						if (msl_options.is_macos() && !msl_options.supports_msl_version(2, 3))
++							SPIRV_CROSS_THROW("Post-depth coverage on Mac requires MSL 2.3.");
++						ep_args += ", post_depth_coverage";
++					}
++					ep_args += "]]";
+ 				}
+-				ep_args += "]]";
+ 				builtin_declaration = false;
+ 			}
+ 		}
+@@ -15009,9 +16016,12 @@
+ 	}
+ }
+ 
+-string CompilerMSL::entry_point_args_argument_buffer(bool append_comma)
++string CompilerMSL::entry_point_args_argument_buffer(bool append_comma, bool include_stage_in, bool include_builtins,
++                                                     bool add_names)
+ {
+-	string ep_args = entry_point_arg_stage_in();
++	string ep_args = include_stage_in ? entry_point_arg_stage_in() : "";
++	if (msl_options.for_mesh_pipeline && get_execution_model() == ExecutionModelGeometry)
++		ep_args += join(ep_args.empty() ? "" : ", ", "thread GeometryInput * _RESERVED_IDENTIFIER_FIXUP_gl_in");
+ 	Bitset claimed_bindings;
+ 
+ 	for (uint32_t i = 0; i < kMaxArgumentBuffers; i++)
+@@ -15020,7 +16030,8 @@
+ 		if (id == 0)
+ 			continue;
+ 
+-		add_resource_name(id);
++		if (add_names)
++			add_resource_name(id);
+ 		auto &var = get<SPIRVariable>(id);
+ 		auto &type = get_variable_data_type(var);
+ 
+@@ -15054,13 +16065,17 @@
+ 		else
+ 			ep_args += type_to_glsl(type) + "& " + to_restrict(id, true) + to_name(id);
+ 
+-		ep_args += " [[buffer(" + convert_to_string(buffer_binding) + ")]]";
++		if (!msl_options.for_mesh_pipeline)
++			ep_args += " [[buffer(" + convert_to_string(buffer_binding) + ")]]";
++		else
++			ep_args += " /*[[buffer(" + convert_to_string(buffer_binding) + ")]]*/";
+ 
+ 		next_metal_resource_index_buffer = max(next_metal_resource_index_buffer, buffer_binding + 1);
+ 	}
+ 
+-	entry_point_args_discrete_descriptors(ep_args);
+-	entry_point_args_builtin(ep_args);
++	entry_point_args_discrete_descriptors(ep_args, add_names);
++	if (include_builtins)
++		entry_point_args_builtin(ep_args);
+ 
+ 	if (!ep_args.empty() && append_comma)
+ 		ep_args += ", ";
+@@ -15090,23 +16105,12 @@
+ 	return nullptr;
+ }
+ 
+-void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
++SmallVector<CompilerMSL::Entry_Point_Resource> CompilerMSL::get_sorted_entry_point_args(bool add_name)
+ {
+ 	// Output resources, sorted by resource index & type
+ 	// We need to sort to work around a bug on macOS 10.13 with NVidia drivers where switching between shaders
+ 	// with different order of buffers can result in issues with buffer assignments inside the driver.
+-	struct Resource
+-	{
+-		SPIRVariable *var;
+-		SPIRVariable *discrete_descriptor_alias;
+-		string name;
+-		SPIRType::BaseType basetype;
+-		uint32_t index;
+-		uint32_t plane;
+-		uint32_t secondary_index;
+-	};
+-
+-	SmallVector<Resource> resources;
++	SmallVector<Entry_Point_Resource> resources;
+ 
+ 	entry_point_bindings.clear();
+ 	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
+@@ -15160,7 +16164,7 @@
+ 						// and it's being used as an alias (so we can emit void* instead).
+ 						resource.discrete_descriptor_alias = resource.var;
+ 						// Need to promote interlocked usage so that the primary declaration is correct.
+-						if (interlocked_resources.count(var_id))
++						if (add_name && interlocked_resources.count(var_id))
+ 							interlocked_resources.insert(resource.var->self);
+ 
+ 						// Aliasing with unroll just gets too messy to deal with. I sure hope this never comes up ...
+@@ -15194,7 +16198,7 @@
+ 
+ 			if (type.basetype == SPIRType::SampledImage)
+ 			{
+-				add_resource_name(var_id);
++				if (add_name) add_resource_name(var_id);
+ 
+ 				uint32_t plane_count = 1;
+ 				if (constexpr_sampler && constexpr_sampler->ycbcr_conversion_enable)
+@@ -15214,7 +16218,7 @@
+ 			else if (!constexpr_sampler)
+ 			{
+ 				// constexpr samplers are not declared as resources.
+-				add_resource_name(var_id);
++				if (add_name) add_resource_name(var_id);
+ 
+ 				// Don't allocate resource indices for aliases.
+ 				uint32_t resource_index = ~0u;
+@@ -15229,9 +16233,16 @@
+ 	});
+ 
+ 	stable_sort(resources.begin(), resources.end(),
+-	            [](const Resource &lhs, const Resource &rhs)
++	            [](const Entry_Point_Resource &lhs, const Entry_Point_Resource &rhs)
+ 	            { return tie(lhs.basetype, lhs.index) < tie(rhs.basetype, rhs.index); });
+ 
++	return resources;
++}
++
++void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args, bool add_names)
++{
++	auto resources = get_sorted_entry_point_args(add_names);
++
+ 	for (auto &r : resources)
+ 	{
+ 		auto &var = *r.var;
+@@ -15309,12 +16320,22 @@
+ 				{
+ 					if (!ep_args.empty())
+ 						ep_args += ", ";
+-					ep_args += get_variable_address_space(var) + " " + type_to_glsl(type) + "* " +
+-							   to_restrict(var_id, true) + r.name + "_" + convert_to_string(i);
+-					ep_args += " [[buffer(" + convert_to_string(r.index + i) + ")";
+-					if (interlocked_resources.count(var_id))
+-						ep_args += ", raster_order_group(0)";
+-					ep_args += "]]";
++					ep_args += get_variable_address_space(var) + " " + type_to_glsl(type) + "* " + to_restrict(var_id, true) +
++					           r.name + "_" + convert_to_string(i);
++					if (!msl_options.for_mesh_pipeline)
++					{
++						ep_args += " [[buffer(" + convert_to_string(r.index + i) + ")";
++						if (interlocked_resources.count(var_id))
++							ep_args += ", raster_order_group(0)";
++						ep_args += "]]";
++					}
++					else
++					{
++						ep_args += " /*[[buffer(" + convert_to_string(r.index + i) + ")";
++						if (interlocked_resources.count(var_id))
++							ep_args += ", raster_order_group(0)";
++						ep_args += "]]*/";
++					}
+ 				}
+ 				is_using_builtin_array = false;
+ 			}
+@@ -15329,10 +16350,20 @@
+ 				else
+ 					ep_args += type_to_glsl(type) + "& " + to_restrict(var_id, true) + r.name;
+ 
+-				ep_args += " [[buffer(" + convert_to_string(r.index) + ")";
+-				if (interlocked_resources.count(var_id))
+-					ep_args += ", raster_order_group(0)";
+-				ep_args += "]]";
++				if (!msl_options.for_mesh_pipeline)
++				{
++					ep_args += " [[buffer(" + convert_to_string(r.index) + ")";
++					if (interlocked_resources.count(var_id))
++						ep_args += ", raster_order_group(0)";
++					ep_args += "]]";
++				}
++				else
++				{
++					ep_args += " /*[[buffer(" + convert_to_string(r.index) + ")";
++					if (interlocked_resources.count(var_id))
++						ep_args += ", raster_order_group(0)";
++					ep_args += "]]*/";
++				}
+ 			}
+ 			break;
+ 		}
+@@ -15340,7 +16371,10 @@
+ 			if (!ep_args.empty())
+ 				ep_args += ", ";
+ 			ep_args += sampler_type(type, var_id, false) + " " + r.name;
+-			ep_args += " [[sampler(" + convert_to_string(r.index) + ")]]";
++			if (!msl_options.for_mesh_pipeline)
++				ep_args += " [[sampler(" + convert_to_string(r.index) + ")]]";
++			else
++				ep_args += " /*[[sampler(" + convert_to_string(r.index) + ")]]*/";
+ 			break;
+ 		case SPIRType::Image:
+ 		{
+@@ -15354,12 +16388,20 @@
+ 				ep_args += image_type_glsl(type, var_id, false) + " " + r.name;
+ 				if (r.plane > 0)
+ 					ep_args += join(plane_name_suffix, r.plane);
+-
+-				ep_args += " [[texture(" + convert_to_string(r.index) + ")";
+-
+-				if (interlocked_resources.count(var_id))
+-					ep_args += ", raster_order_group(0)";
+-				ep_args += "]]";
++				if (!msl_options.for_mesh_pipeline)
++				{
++					ep_args += " [[texture(" + convert_to_string(r.index) + ")";
++					if (interlocked_resources.count(var_id))
++						ep_args += ", raster_order_group(0)";
++					ep_args += "]]";
++				}
++				else
++				{
++					ep_args += " /*[[texture(" + convert_to_string(r.index) + ")";
++					if (interlocked_resources.count(var_id))
++						ep_args += ", raster_order_group(0)";
++					ep_args += "]]*/";
++				}
+ 			}
+ 			else
+ 			{
+@@ -15376,10 +16418,17 @@
+ 				const char *cv_flags = decoration_flags_signal_volatile(flags) ? "volatile " : "";
+ 				ep_args += join(", ", cv_flags, "device atomic_", type_to_glsl(get<SPIRType>(basetype.image.type), 0));
+ 				ep_args += "* " + r.name + "_atomic";
+-				ep_args += " [[buffer(" + convert_to_string(r.secondary_index) + ")";
+-				if (interlocked_resources.count(var_id))
+-					ep_args += ", raster_order_group(0)";
+-				ep_args += "]]";
++				if (!msl_options.for_mesh_pipeline) {
++					ep_args += " [[buffer(" + convert_to_string(r.secondary_index) + ")";
++					if (interlocked_resources.count(var_id))
++						ep_args += ", raster_order_group(0)";
++					ep_args += "]]";
++				} else {
++					ep_args += " /*[[buffer(" + convert_to_string(r.secondary_index) + ")";
++					if (interlocked_resources.count(var_id))
++						ep_args += ", raster_order_group(0)";
++					ep_args += "]]*/";
++				}
+ 			}
+ 			break;
+ 		}
+@@ -15399,10 +16448,17 @@
+ 				           type_to_glsl(type, var_id) + "& " + r.name;
+ 			else
+ 				ep_args += type_to_glsl(type, var_id) + " " + r.name;
+-			ep_args += " [[buffer(" + convert_to_string(r.index) + ")";
+-			if (interlocked_resources.count(var_id))
+-				ep_args += ", raster_order_group(0)";
+-			ep_args += "]]";
++			if (!msl_options.for_mesh_pipeline) {
++				ep_args += " [[buffer(" + convert_to_string(r.index) + ")";
++				if (interlocked_resources.count(var_id))
++					ep_args += ", raster_order_group(0)";
++				ep_args += "]]";
++			} else {
++				ep_args += " /*[[buffer(" + convert_to_string(r.index) + ")";
++				if (interlocked_resources.count(var_id))
++					ep_args += ", raster_order_group(0)";
++				ep_args += "]]*/";
++			}
+ 			break;
+ 		}
+ 	}
+@@ -15413,6 +16469,8 @@
+ string CompilerMSL::entry_point_args_classic(bool append_comma)
+ {
+ 	string ep_args = entry_point_arg_stage_in();
++	if (msl_options.for_mesh_pipeline && get_execution_model() == ExecutionModelGeometry)
++		ep_args += join(ep_args.empty() ? "" : ", ", "thread GeometryInput * _RESERVED_IDENTIFIER_FIXUP_gl_in");
+ 	entry_point_args_discrete_descriptors(ep_args);
+ 	entry_point_args_builtin(ep_args);
+ 
+@@ -18194,8 +19252,21 @@
+ 		if (is_mesh_shader())
+ 			break;
+ 		if (storage != StorageClassInput && current_function && (current_function->self == ir.default_entry_point) &&
+-		    !is_stage_output_builtin_masked(builtin))
++		    !is_stage_output_builtin_masked(builtin)) {
++			if (builtin_is_per_primitive_mesh_output(builtin) && get_execution_model() == ExecutionModelGeometry) {
++				return stage_out_mesh_primitive_var_name + "." + CompilerGLSL::builtin_to_glsl(builtin, storage);
++			}
++
+ 			return stage_out_var_name + "." + CompilerGLSL::builtin_to_glsl(builtin, storage);
++		}
++
++		if (current_function && get_execution_model() == ExecutionModelGeometry) {
++			if (storage == StorageClassInput)
++				return stage_in_var_name + "." + CompilerGLSL::builtin_to_glsl(builtin, storage);
++			else if (storage == StorageClassGeneric)
++				return CompilerGLSL::builtin_to_glsl(builtin, storage);
++		}
++
+ 		break;
+ 
+ 	case BuiltInSampleMask:
+@@ -18251,6 +19322,9 @@
+ 		return "simd_is_helper_thread()";
+ 
+ 	case BuiltInPrimitiveId:
++		if (get_execution_model() == ExecutionModelGeometry && storage != StorageClassInput && current_function &&
++		    current_function->self == ir.default_entry_point && stage_out_mesh_primitive_var_id)
++			return stage_out_mesh_primitive_var_name + ".primitive_id";
+ 		return "gl_PrimitiveID";
+ 
+ 	default:
+@@ -18334,6 +19408,7 @@
+ 				SPIRV_CROSS_THROW("PrimitiveId on macOS requires MSL 2.2.");
+ 			return "primitive_id";
+ 		case ExecutionModelMeshEXT:
++		case ExecutionModelGeometry:
+ 			return "primitive_id";
+ 		default:
+ 			SPIRV_CROSS_THROW("PrimitiveId is not supported in this execution model.");
+@@ -18450,7 +19525,8 @@
+ 		else if (execution.model == ExecutionModelKernel || execution.model == ExecutionModelGLCompute ||
+                  execution.model == ExecutionModelTaskEXT || execution.model == ExecutionModelMeshEXT ||
+ 		         execution.model == ExecutionModelTessellationControl ||
+-		         (execution.model == ExecutionModelVertex && msl_options.vertex_for_tessellation))
++		         (execution.model == ExecutionModelVertex &&
++		          (msl_options.vertex_for_tessellation || msl_options.for_mesh_pipeline)))
+ 		{
+ 			// We are generating a Metal kernel function.
+ 			if (!msl_options.supports_msl_version(2))
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index de8608f65d..47b97590de 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -43,8 +43,14 @@
+ 	MSL_SHADER_VARIABLE_FORMAT_OTHER = 0,
+ 	MSL_SHADER_VARIABLE_FORMAT_UINT8 = 1,
+ 	MSL_SHADER_VARIABLE_FORMAT_UINT16 = 2,
+-	MSL_SHADER_VARIABLE_FORMAT_ANY16 = 3,
+-	MSL_SHADER_VARIABLE_FORMAT_ANY32 = 4,
++	MSL_SHADER_VARIABLE_FORMAT_UINT32 = 3,
++	MSL_SHADER_VARIABLE_FORMAT_FLOAT = 4,
++	MSL_SHADER_VARIABLE_FORMAT_INT8 = 5,
++	MSL_SHADER_VARIABLE_FORMAT_INT16 = 6,
++	MSL_SHADER_VARIABLE_FORMAT_INT32 = 7,
++	MSL_SHADER_VARIABLE_FORMAT_HALF = 8,
++	MSL_SHADER_VARIABLE_FORMAT_ANY16 = 9,
++	MSL_SHADER_VARIABLE_FORMAT_ANY32 = 10,
+ 
+ 	// Deprecated aliases.
+ 	MSL_VERTEX_FORMAT_OTHER = MSL_SHADER_VARIABLE_FORMAT_OTHER,
+@@ -53,8 +59,6 @@
+ 	MSL_SHADER_INPUT_FORMAT_OTHER = MSL_SHADER_VARIABLE_FORMAT_OTHER,
+ 	MSL_SHADER_INPUT_FORMAT_UINT8 = MSL_SHADER_VARIABLE_FORMAT_UINT8,
+ 	MSL_SHADER_INPUT_FORMAT_UINT16 = MSL_SHADER_VARIABLE_FORMAT_UINT16,
+-	MSL_SHADER_INPUT_FORMAT_ANY16 = MSL_SHADER_VARIABLE_FORMAT_ANY16,
+-	MSL_SHADER_INPUT_FORMAT_ANY32 = MSL_SHADER_VARIABLE_FORMAT_ANY32,
+ 
+ 	MSL_SHADER_VARIABLE_FORMAT_INT_MAX = 0x7fffffff
+ };
+@@ -82,6 +86,11 @@
+ 	BuiltIn builtin = BuiltInMax;
+ 	uint32_t vecsize = 0;
+ 	MSLShaderVariableRate rate = MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
++	SPIRType::BaseType type = SPIRType::Unknown;
++	uint32_t offset = 0;
++	uint32_t stride = 0;
++	uint32_t binding = 0;
++	bool normalized = false;
+ };
+ 
+ // Matches the binding index of a MSL resource for a binding within a descriptor set.
+@@ -319,6 +328,7 @@
+ 		uint32_t shader_patch_input_buffer_index = 20;
+         uint32_t draw_id_buffer_index = 19;
+ 		uint32_t reversed_depth_viewport_buffer_index = 18;
++		uint32_t draw_info_index = 20;
+ 		uint32_t shader_input_wg_index = 0;
+ 		uint32_t device_index = 0;
+ 		uint32_t enable_frag_output_mask = 0xffffffff;
+@@ -550,6 +560,24 @@
+ 		// Requires MSL 3.2 or above, and has no effect with earlier MSL versions.
+ 		bool use_fast_math_pragmas = false;
+ 
++        // Compile for use with a geometry shader. If set, vertex shaders will be compiled as [[object]]
++        // functions, and geometry shaders as [[mesh]].
++		bool for_mesh_pipeline = false;
++
++		enum class PrimitiveTopology {
++			Points,
++			Lines,
++			LineStrip,
++			TriangleFan,
++			LinesAdjacency,
++			LineStripAdjacency,
++			Triangles,
++			TriangleStrip,
++			TrianglesAdjacency,
++			TriangleStripAdjacency
++		} input_primitive_type;
++		uint32_t geometry_invocations = 1;
++
+ 		bool is_ios() const
+ 		{
+ 			return platform == iOS;
+@@ -904,6 +932,7 @@
+ 		SPVFuncImplMulExtended,
+ 		SPVFuncImplSetMeshOutputsEXT,
+ 		SPVFuncImplAssume,
++		SPVFuncImplEmitVertex,
+ 	};
+ 
+ 	// If the underlying resource has been used for comparison then duplicate loads of that resource must be too
+@@ -919,6 +948,8 @@
+ 	                                           const uint32_t *args, uint32_t count) override;
+ 	void emit_header() override;
+ 	void emit_function_prototype(SPIRFunction &func, const Bitset &return_flags) override;
++	void append_global_func_args(const SPIRFunction &func, uint32_t index,
++	                             SmallVector<std::string> &arglist) override;
+ 	void emit_sampled_image_op(uint32_t result_type, uint32_t result_id, uint32_t image_id, uint32_t samp_id) override;
+ 	void emit_subgroup_op(const Instruction &i) override;
+ 	void emit_subgroup_cluster_op(uint32_t result_type, uint32_t result_id, uint32_t cluster_size, uint32_t op0,
+@@ -1004,7 +1035,7 @@
+ 	void extract_global_variables_from_function(uint32_t func_id, std::set<uint32_t> &added_arg_ids,
+ 	                                            std::unordered_set<uint32_t> &global_var_ids,
+ 	                                            std::unordered_set<uint32_t> &processed_func_ids);
+-	uint32_t add_interface_block(StorageClass storage, bool patch = false);
++	uint32_t add_interface_block(StorageClass storage, bool patch = false, bool mesh_primitive = false);
+ 	uint32_t add_interface_block_pointer(uint32_t ib_var_id, StorageClass storage);
+ 	uint32_t add_meshlet_block(bool per_primitive);
+ 
+@@ -1070,6 +1101,7 @@
+ 	bool maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs);
+ 	bool is_var_runtime_size_array(const SPIRVariable &var) const;
+ 	uint32_t get_resource_array_size(const SPIRType &type, uint32_t id) const;
++	void emit_mesh_wrapper();
+ 
+ 	void fix_up_shader_inputs_outputs();
+ 
+@@ -1078,10 +1110,24 @@
+ 	bool entry_point_requires_const_device_buffers() const;
+ 	std::string func_type_decl(SPIRType &type);
+ 	std::string entry_point_args_classic(bool append_comma);
+-	std::string entry_point_args_argument_buffer(bool append_comma);
++	std::string entry_point_args_argument_buffer(bool append_comma, bool include_stage_in = true,
++	                                             bool include_builtins = true, bool add_names = true);
+ 	std::string entry_point_arg_stage_in();
+ 	void entry_point_args_builtin(std::string &args);
+-	void entry_point_args_discrete_descriptors(std::string &args);
++	void entry_point_args_discrete_descriptors(std::string &args, bool add_names = true);
++
++	struct Entry_Point_Resource
++	{
++		SPIRVariable *var;
++		SPIRVariable *discrete_descriptor_alias;
++		std::string name;
++		SPIRType::BaseType basetype;
++		uint32_t index;
++		uint32_t plane;
++		uint32_t secondary_index;
++	};
++
++	SmallVector<Entry_Point_Resource> get_sorted_entry_point_args(bool add_name = true);
+ 	std::string append_member_name(const std::string &qualifier, const SPIRType &type, uint32_t index);
+ 	std::string ensure_valid_name(std::string name, std::string pfx);
+ 	std::string to_sampler_expression(uint32_t id);
+@@ -1265,6 +1311,7 @@
+ 	VariableID mesh_out_per_vertex = 0;
+ 	VariableID mesh_out_per_primitive = 0;
+ 	VariableID stage_out_masked_builtin_type_id = 0;
++	VariableID stage_out_mesh_primitive_var_id = 0;
+ 
+ 	// Handle HLSL-style 0-based vertex/instance index.
+ 	enum class TriState
+@@ -1301,6 +1348,7 @@
+ 	std::string qual_viewport_idx_var_name;
+ 	std::string stage_in_var_name = "in";
+ 	std::string stage_out_var_name = "out";
++	std::string stage_out_mesh_primitive_var_name = "out_1";
+ 	std::string patch_stage_in_var_name = "patchIn";
+ 	std::string patch_stage_out_var_name = "patchOut";
+ 	std::string sampler_name_suffix = "Smplr";

@@ -857,7 +857,6 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
 		return;
 	}
 	if (pCreateInfo->pInputAssemblyState && !isRenderingPoints()) {
-		VkPrimitiveTopology topology = pCreateInfo->pInputAssemblyState->topology;
 		_mtlPrimitiveType = mvkMTLPrimitiveTypeFromVkPrimitiveTopology(pCreateInfo->pInputAssemblyState->topology);
 	}
 
@@ -2606,33 +2605,8 @@ void MVKGraphicsPipeline::addNextStageInputToShaderConversionConfig(SPIRVToMSLCo
 
 		#if MVK_XCODE_14
 		sosv.type = si.baseType;
-		sosv.format = toMslShaderFormat(getPixelFormats()->getFormatType(mvkFormatFromOutput(si)));
-		#else
-		switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(si) ) ) {
-            case kMVKFormatColorUInt8:
-                sosv.format = MSL_SHADER_VARIABLE_FORMAT_UINT8;
-                break;
-
-            case kMVKFormatColorUInt16:
-                sosv.format = MSL_SHADER_VARIABLE_FORMAT_UINT16;
-                break;
-
-			case kMVKFormatColorHalf:
-			case kMVKFormatColorInt16:
-				sosv.format = MSL_SHADER_VARIABLE_FORMAT_ANY16;
-				break;
-
-			case kMVKFormatColorFloat:
-			case kMVKFormatColorInt32:
-			case kMVKFormatColorUInt32:
-				sosv.format = MSL_SHADER_VARIABLE_FORMAT_ANY32;
-				break;
-
-            default:
-				sosv.format = MSL_SHADER_VARIABLE_FORMAT_OTHER;
-                break;
-		}
 		#endif
+		sosv.format = mvkInterfaceFormatFromBaseType(si.baseType);
 		shaderConfig.shaderOutputs.push_back(so);
     }
 }
@@ -2653,35 +2627,10 @@ void MVKGraphicsPipeline::addPrevStageOutputToShaderConversionConfig(SPIRVToMSLC
         sisv.vecsize = so.vecWidth;
 		sisv.rate = so.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
 
-        #if MVK_XCODE_14
+		#if MVK_XCODE_14
         sisv.type = so.baseType;
-        sisv.format = toMslShaderFormat(getPixelFormats()->getFormatType(mvkFormatFromOutput(so)));
-        #else
-        switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(so) ) ) {
-            case kMVKFormatColorUInt8:
-                sisv.format = MSL_SHADER_VARIABLE_FORMAT_UINT8;
-                break;
-
-            case kMVKFormatColorUInt16:
-                sisv.format = MSL_SHADER_VARIABLE_FORMAT_UINT16;
-                break;
-
-			case kMVKFormatColorHalf:
-			case kMVKFormatColorInt16:
-				sisv.format = MSL_SHADER_VARIABLE_FORMAT_ANY16;
-				break;
-
-			case kMVKFormatColorFloat:
-			case kMVKFormatColorInt32:
-			case kMVKFormatColorUInt32:
-				sisv.format = MSL_SHADER_VARIABLE_FORMAT_ANY32;
-				break;
-
-            default:
-				sisv.format = MSL_SHADER_VARIABLE_FORMAT_OTHER;
-                break;
-        }
-        #endif
+		#endif
+		sisv.format = mvkInterfaceFormatFromBaseType(so.baseType);
         shaderConfig.shaderInputs.push_back(si);
     }
 }
