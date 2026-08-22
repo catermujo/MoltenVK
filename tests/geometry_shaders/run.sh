@@ -37,14 +37,6 @@ compile_geometry geometry_line lines
 compile_geometry geometry_triangle triangles
 compile_geometry geometry_builtins triangles
 compile_geometry geometry_triangle_adjacency triangles-adjacency
-
-glslc -fshader-stage=geom \
-	-o "$BUILD/geometry_multi_invocation.spv" \
-	"$SCRIPT_DIR/geometry_multi_invocation.geom"
-if "$BUILD/geometry_msl_test" "$BUILD/geometry_multi_invocation.spv" \
-	"$BUILD/geometry_multi_invocation.msl" triangles; then
-	echo "multi-invocation geometry shader unexpectedly compiled" >&2
-	exit 1
-fi
+compile_geometry geometry_multi_invocation triangles
 
 echo "geometry shader mesh lowering tests passed"
