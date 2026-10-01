@@ -1,0 +1,78 @@
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -3271,42 +3271,19 @@
+ 
+ void CompilerGLSL::replace_illegal_names(const unordered_set<string> &keywords)
+ {
+-	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, const SPIRVariable &var) {
+-		if (is_hidden_variable(var))
+-			return;
+-
+-		auto *meta = ir.find_meta(var.self);
+-		if (!meta)
+-			return;
+-
+-		auto &m = meta->decoration;
+-		if (keywords.find(m.alias) != end(keywords))
+-			m.alias = join("_", m.alias);
+-	});
+-
+-	ir.for_each_typed_id<SPIRFunction>([&](uint32_t, const SPIRFunction &func) {
+-		auto *meta = ir.find_meta(func.self);
+-		if (!meta)
+-			return;
+-
+-		auto &m = meta->decoration;
+-		if (keywords.find(m.alias) != end(keywords))
+-			m.alias = join("_", m.alias);
+-	});
+-
+-	ir.for_each_typed_id<SPIRType>([&](uint32_t, const SPIRType &type) {
+-		auto *meta = ir.find_meta(type.self);
+-		if (!meta)
+-			return;
+-
+-		auto &m = meta->decoration;
+-		if (keywords.find(m.alias) != end(keywords))
+-			m.alias = join("_", m.alias);
+-
+-		for (auto &memb : meta->members)
++	for (auto &entry : ir.meta)
++	{
++		if (ir.ids[entry.first].get_type() == TypeVariable && is_hidden_variable(get<SPIRVariable>(entry.first)))
++			continue;
++
++		auto &m = entry.second;
++		if (keywords.find(m.decoration.alias) != end(keywords))
++			m.decoration.alias = join("_", m.decoration.alias);
++
++		for (auto &memb : m.members)
+ 			if (keywords.find(memb.alias) != end(keywords))
+ 				memb.alias = join("_", memb.alias);
+-	});
++	}
+ }
+ 
+ void CompilerGLSL::replace_illegal_names()
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -17902,15 +17902,12 @@
+ 	auto &keywords = get_reserved_keyword_set();
+ 	auto &illegal_func_names = get_illegal_func_names();
+ 
+-	ir.for_each_typed_id<SPIRVariable>([&](uint32_t self, SPIRVariable &) {
+-		auto *meta = ir.find_meta(self);
+-		if (!meta)
+-			return;
+-
+-		auto &dec = meta->decoration;
++	for (auto &entry : ir.meta)
++	{
++		auto &dec = entry.second.decoration;
+ 		if (keywords.find(dec.alias) != end(keywords))
+ 			dec.alias += "0";
+-	});
++	}
+ 
+ 	ir.for_each_typed_id<SPIRFunction>([&](uint32_t self, SPIRFunction &) {
+ 		auto *meta = ir.find_meta(self);
