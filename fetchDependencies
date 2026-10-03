@@ -341,16 +341,7 @@ else
 
 	update_repo ${REPO_NAME} ${REPO_URL} ${REPO_REV}
 
-	for SPIRV_CROSS_PATCH in "$(pwd)/../patches/SPIRV-Cross/"*.patch; do
-		if git -C "${REPO_NAME}" apply --reverse --check "${SPIRV_CROSS_PATCH}" >/dev/null 2>&1; then
-			:
-		elif git -C "${REPO_NAME}" apply --check "${SPIRV_CROSS_PATCH}" >/dev/null 2>&1; then
-			git -C "${REPO_NAME}" apply "${SPIRV_CROSS_PATCH}"
-		else
-			echo "SPIRV-Cross patch ${SPIRV_CROSS_PATCH} does not apply to ${REPO_REV}" >&2
-			exit 1
-		fi
-	done
+	/bin/bash ../Scripts/apply_spirv_cross_patches.sh "${REPO_NAME}"
 fi
 
 

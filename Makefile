@@ -46,6 +46,7 @@ all-debug:
 
 .PHONY: macos
 macos:
+	/bin/bash Scripts/apply_spirv_cross_patches.sh "$(CURDIR)/External/SPIRV-Cross"
 	# DUMBAI: Refresh the nested SPIRV-Cross framework before linking MoltenVK against it.
 	$(XCODEBUILD) build -project "ExternalDependencies.xcodeproj" -scheme "SPIRV-Cross-macOS" -configuration Release -destination "generic/platform=macOS" SKIP_PACKAGING=NO $(OUTPUT_FMT_CMD)
 	MVK_XCFWK_STAGING_DIR="$(CURDIR)/External/build/Intermediates/XCFrameworkStaging" MVK_XCFWK_DEST_DIR="$(CURDIR)/External/build/Release" CONFIGURATION=Release /bin/bash -c '. Scripts/create_xcframework_func.sh; create_xcframework SPIRVCross library'
