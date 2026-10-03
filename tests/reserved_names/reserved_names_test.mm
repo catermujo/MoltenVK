@@ -47,7 +47,7 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        const float expected[] = {1, 2, 2, 4, 2, 3, 4, 6, 3, 4, 6, 8};
+        const float expected[] = {1, 2, 2, 4, 2, 3, 4, 6, 3, 4, 6, 8, 1, 1, 0, 0, 0, 1, 17, 0};
         id<MTLBuffer> output = [device newBufferWithLength:sizeof(expected) options:MTLResourceStorageModeShared];
         id<MTLCommandQueue> queue = [device newCommandQueue];
         id<MTLCommandBuffer> command = [queue commandBuffer];
@@ -74,6 +74,6 @@ int main(int argc, char **argv)
             }
         }
     }
-    std::cout << "reserved temporary names compile and execute correctly\n";
+    std::cout << "reserved temporary and function names compile and execute correctly\n";
     return 0;
 }

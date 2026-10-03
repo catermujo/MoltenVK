@@ -1,0 +1,11 @@
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -17764,6 +17764,8 @@
+ 		"divide",
+ 		"fmod",
+ 		"median3",
++		// DUMBAI: Slang can lower finite checks to a function that collides with metal::isfinite.
++		"isfinite",
+ 		"VARIABLE_TRACEPOINT",
+ 		"STATIC_DATA_TRACEPOINT",
+ 		"STATIC_DATA_TRACEPOINT_V",

@@ -8,7 +8,7 @@ SLANG="$ROOT/../slang/build/Release/bin/slangc"
 BUILD=$(mktemp -d "${TMPDIR:-/tmp}/mvk-reserved-names.XXXXXX")
 trap 'rm -rf "$BUILD"' EXIT
 
-make -C "$CROSS" -j4 >/dev/null
+make -C "$CROSS" -j"${MVK_TEST_JOBS:-1}" >/dev/null
 "$SLANG" "$SCRIPT_DIR/temporary_names.slang" -entry main -stage compute \
     -target spirv -profile spirv_1_5 -O0 -g1 -o "$BUILD/temporary_names.spv"
 clang++ -std=c++11 -fobjc-arc -Wall -Wextra \
