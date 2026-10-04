@@ -2,6 +2,8 @@ XC_PROJ := MoltenVKPackaging.xcodeproj
 XC_SCHEME := MoltenVK Package
 
 XCODEBUILD := set -o pipefail && $(shell command -v xcodebuild)
+# DUMBAI: Desktop depots target Apple Silicon; build both MoltenVK and SPIRV-Cross without unused Intel slices.
+MACOS_ARCHS ?= arm64
 # Used to determine if xcpretty is available
 XCPRETTY_PATH := $(shell command -v xcpretty 2> /dev/null)
 
@@ -16,7 +18,7 @@ endif
 
 # Collect all build settings defined on the command-line (eg: MVK_HIDE_VULKAN_SYMBOLS=1, MVK_CONFIG_LOG_LEVEL=3...)
 MAKEARGS := $(strip \
-  $(foreach v,$(.VARIABLES),\
+  $(foreach v,$(filter-out MACOS_ARCHS,$(.VARIABLES)),\
     $(if $(filter command\ line,$(origin $(v))),\
       $(v)=$(value $(v)) ,)))
 
@@ -48,13 +50,13 @@ all-debug:
 macos:
 	/bin/bash Scripts/apply_spirv_cross_patches.sh "$(CURDIR)/External/SPIRV-Cross"
 	# DUMBAI: Refresh the nested SPIRV-Cross framework before linking MoltenVK against it.
-	$(XCODEBUILD) build -project "ExternalDependencies.xcodeproj" -scheme "SPIRV-Cross-macOS" -configuration Release -destination "generic/platform=macOS" SKIP_PACKAGING=NO $(OUTPUT_FMT_CMD)
+	$(XCODEBUILD) build -project "ExternalDependencies.xcodeproj" -scheme "SPIRV-Cross-macOS" -configuration Release -destination "generic/platform=macOS" ARCHS="$(MACOS_ARCHS)" SKIP_PACKAGING=NO $(OUTPUT_FMT_CMD)
 	MVK_XCFWK_STAGING_DIR="$(CURDIR)/External/build/Intermediates/XCFrameworkStaging" MVK_XCFWK_DEST_DIR="$(CURDIR)/External/build/Release" CONFIGURATION=Release /bin/bash -c '. Scripts/create_xcframework_func.sh; create_xcframework SPIRVCross library'
-	$(XCODEBUILD) build -project "$(XC_PROJ)" -scheme "$(XC_SCHEME) (macOS only)" -destination "generic/platform=macOS" GCC_PREPROCESSOR_DEFINITIONS='$${inherited} $(MAKEARGS)' $(OUTPUT_FMT_CMD)
+	$(XCODEBUILD) build -project "$(XC_PROJ)" -scheme "$(XC_SCHEME) (macOS only)" -destination "generic/platform=macOS" ARCHS="$(MACOS_ARCHS)" GCC_PREPROCESSOR_DEFINITIONS='$${inherited} $(MAKEARGS)' $(OUTPUT_FMT_CMD)
 
 .PHONY: macos-debug
 macos-debug:
-	$(XCODEBUILD) build -project "$(XC_PROJ)" -scheme "$(XC_SCHEME) (macOS only)" -destination "generic/platform=macOS" -configuration "Debug" GCC_PREPROCESSOR_DEFINITIONS='$${inherited} $(MAKEARGS)' $(OUTPUT_FMT_CMD)
+	$(XCODEBUILD) build -project "$(XC_PROJ)" -scheme "$(XC_SCHEME) (macOS only)" -destination "generic/platform=macOS" -configuration "Debug" ARCHS="$(MACOS_ARCHS)" GCC_PREPROCESSOR_DEFINITIONS='$${inherited} $(MAKEARGS)' $(OUTPUT_FMT_CMD)
 
 .PHONY: ios
 ios:
