@@ -3,7 +3,6 @@
 
 #include "spirv_msl.hpp"
 
-#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <vector>

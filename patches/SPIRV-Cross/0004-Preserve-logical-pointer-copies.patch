@@ -1,0 +1,34 @@
+diff --git i/spirv_glsl.cpp w/spirv_glsl.cpp
+index dd7014df..84f5936f 100644
+--- i/spirv_glsl.cpp
++++ w/spirv_glsl.cpp
+@@ -10937,7 +10914,10 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
+ 	// For now we don't really care about types since we're just doing a single index into the heap.
+ 	// If we intend to support complete untyped pointers usage later, we need to pass down the base type
+ 	// and override chain type based on that.
+-	const auto *type = untyped_data_type ? untyped_data_type : &get_pointee_type(type_id);
++	// DUMBAI: Arrays of pointers inherit the pointer flag but remain aggregate values, not pointer operands.
++	const auto &base_type = get<SPIRType>(type_id);
++	const auto *type = untyped_data_type ? untyped_data_type :
++	                   is_pointer(base_type) ? &get_pointee_type(base_type) : &base_type;
+ 
+ 	if (!backend.native_pointers)
+ 	{
+@@ -20210,7 +20190,16 @@ void CompilerGLSL::emit_copy_logical_type(uint32_t lhs_id, uint32_t lhs_type_id,
+ 	auto &lhs_type = get<SPIRType>(lhs_type_id);
+ 	auto &rhs_type = get<SPIRType>(rhs_type_id);
+ 
+-	if (!lhs_type.array.empty())
++	if (is_physical_pointer(lhs_type))
++	{
++		// DUMBAI: Pointer types inherit pointee shape, but logical copies preserve the pointer value, not its storage.
++		auto lhs = access_chain_internal(lhs_id, chain.data(), uint32_t(chain.size()),
++		                                 ACCESS_CHAIN_INDEX_IS_LITERAL_BIT, nullptr, nullptr);
++		auto rhs = access_chain_internal(rhs_id, chain.data(), uint32_t(chain.size()),
++		                                 ACCESS_CHAIN_INDEX_IS_LITERAL_BIT, nullptr, nullptr);
++		statement(lhs, " = ", rhs, ";");
++	}
++	else if (!lhs_type.array.empty())
+ 	{
+ 		// Could use a loop here to support specialization constants, but it gets rather complicated with nested array types,
+ 		// and this is a rather obscure opcode anyways, keep it simple unless we are forced to.
