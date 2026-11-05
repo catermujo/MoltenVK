@@ -275,6 +275,7 @@ void MVKSwapchain::endPresentation(const MVKImagePresentInfo& presentInfo, uint6
 	_presentTimingHistory[_presentHistoryIndex].earliestPresentTime = actualPresentTime;
 	_presentTimingHistory[_presentHistoryIndex].presentMargin = actualPresentTime > beginPresentTime ? actualPresentTime - beginPresentTime : 0;
 	_presentHistoryIndex = (_presentHistoryIndex + 1) % kMaxPresentationHistory;
+	notifyPresentComplete(presentInfo);
 }
 
 void MVKSwapchain::notifyPresentComplete(const MVKImagePresentInfo& presentInfo) {
